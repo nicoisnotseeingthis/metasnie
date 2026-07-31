@@ -1,0 +1,20 @@
+{
+  "concurrency": 100000000000000000000000000000000000,
+  "loop_mode": true,
+  "snipe_mode": true,
+  "copy_clipboard": true,
+  "sound_alert": false,
+  "webhook_enabled": true,
+  "webhook_url": "https://discordapp.com/api/webhooks/1527418214785618011/3J-uH4K3dVHkTCJprr0ypj5jvcok55Xx3LZK5eDPWpnpJTOs_fwbEWgJ9SnsHjfIc295",
+  "webhook_template": "**Available** `{name}` \u2014 https://horizon.meta.com/profile/{name}/",
+  "cycle_delay": 0,
+  "selected_list": "lists\\text_content (1).txt",
+  "timeout_total": 0.0,
+  "timeout_connect": 100000.0,
+  "theme_hue": 340,
+  "theme_sat": 0.95,
+  "opacity": 1.0,
+  "preset": "Custom",
+  "log_filter": "all",
+  "snipe_cred_index": 0
+}
