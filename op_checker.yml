@@ -36,7 +36,7 @@ jobs:
 
       - name: Run headless checker
         env:
-          # 5 hours 30 minutes in seconds (leaves setup time before the 6h cap)
+          # 5 hours 30 minutes in seconds
           MAX_RUNTIME: '19800'
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python headless.py
