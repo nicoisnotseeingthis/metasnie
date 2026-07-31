@@ -8,7 +8,7 @@
   "webhook_url": "https://discordapp.com/api/webhooks/1527418214785618011/3J-uH4K3dVHkTCJprr0ypj5jvcok55Xx3LZK5eDPWpnpJTOs_fwbEWgJ9SnsHjfIc295",
   "webhook_template": "**Available** `{name}` \u2014 https://horizon.meta.com/profile/{name}/",
   "cycle_delay": 0,
-  "selected_list": "lists\\text_content (1).txt",
+  "selected_list": "lists\\text_content.txt",
   "timeout_total": 0.0,
   "timeout_connect": 100000.0,
   "theme_hue": 340,
