@@ -2,6 +2,7 @@ add
 ago
 get
 app
+jew
 Art
 ask
 aura
