@@ -2,7 +2,7 @@ add
 ago
 get
 app
-art
+Art
 ask
 aura
 rap
@@ -34,7 +34,7 @@ Dog
 drug
 dry
 DVD
-each
+Each
 ego
 emo
 end
@@ -115,7 +115,7 @@ set
 sick
 sin
 slit
-soar
+SOAR
 son
 spy
 stab
@@ -146,5 +146,5 @@ yet
 you
 zip
 gone
-hat
+Hat
 Goth
