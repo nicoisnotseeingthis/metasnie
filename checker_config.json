@@ -1,5 +1,5 @@
 {
-  "concurrency": 100000000000000000000000000000000000,
+  "concurrency": 64,
   "loop_mode": true,
   "snipe_mode": true,
   "copy_clipboard": true,
@@ -9,8 +9,8 @@
   "webhook_template": "**Available** `{name}` \u2014 https://horizon.meta.com/profile/{name}/",
   "cycle_delay": 0,
   "selected_list": "lists\\text_content.txt",
-  "timeout_total": 0.0,
-  "timeout_connect": 100000.0,
+  "timeout_total": 3.0,
+  "timeout_connect": 2.0,
   "theme_hue": 340,
   "theme_sat": 0.95,
   "opacity": 1.0,

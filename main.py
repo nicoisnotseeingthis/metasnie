@@ -730,6 +730,7 @@ class Engine:
         self.running, self.paused = False, False
         self._cache, self._found, self._cycle = set(), 0, 0
         self._total_checks = 0
+        self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
 
     def start(self):
         if self.running: return
@@ -737,7 +738,12 @@ class Engine:
         self._cache.clear(); self._found = 0; self._cycle = 0
         self._total_checks = 0
         SNIPER_POOL.start(on_log=self.on_log)  # pre-warm all snipe sessions & tokens
-        threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True).start()
+        def _go():
+            try:
+                import uvloop; uvloop.install()
+            except Exception: pass
+            asyncio.run(self._run())
+        threading.Thread(target=_go, daemon=True).start()
 
     def pause(self): self.paused = True
     def resume(self): self.paused = False
@@ -754,41 +760,30 @@ class Engine:
         if not names:
             self.on_log("list is empty", "err"); self.running = False; return
 
-        tc = float(cfg.get("timeout_total",   0.5))
-        cc = float(cfg.get("timeout_connect", 0.1))
+        # Sane timeouts: 0 / huge values in old configs mean "hang forever", which
+        # pins a worker slot on a dead socket.
+        tc = float(cfg.get("timeout_total", 0) or 0)
+        cc = float(cfg.get("timeout_connect", 0) or 0)
+        tc = tc if 0 < tc <= 10 else 3.0
+        cc = cc if 0 < cc <= 10 else 2.0
+        # Global in-flight cap. Burst tests stayed clean at 64 (~230 names/s); the
+        # old 5-per-name fan-out was 5x the requests for no faster detection.
+        conc = int(cfg.get("concurrency", 0) or 0)
+        conc = conc if 0 < conc <= 512 else 64
         loop_mode = cfg.get("loop_mode", True)
-        CONCUR = 5  # simultaneous requests per name
-        self.on_log(f"{len(names)} names — FULL SEND (×{CONCUR}/name, {tc}s timeout)", "info")
-
-        # Pre-resolve DNS once — all requests skip lookup
-        import socket
-        try:
-            _ip = socket.gethostbyname("horizon.meta.com")
-            self.on_log(f"DNS resolved: {_ip}", "info")
-        except: _ip = None
+        self.on_log(f"{len(names)} names — HEAD x{conc} in flight, {tc}s timeout", "info")
 
         _timeout = aiohttp.ClientTimeout(total=tc, connect=cc)
-        _hdrs = {"User-Agent": "Mozilla/5.0", "Connection": "keep-alive",
-                 "Accept-Encoding": "identity"}
-
-        # Single shared connector + session — one pool, optimal connection reuse.
+        _hdrs = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US",
+                 "Connection": "keep-alive", "Accept-Encoding": "identity"}
         conn = aiohttp.TCPConnector(
-            limit=0, limit_per_host=0,
+            limit=conc, limit_per_host=conc,
             use_dns_cache=True, ttl_dns_cache=600,
-            keepalive_timeout=60,
-            enable_cleanup_closed=True,
-            force_close=False,
-            ssl=False,
+            keepalive_timeout=120, enable_cleanup_closed=True, ssl=False,
         )
-        if _ip:
-            try: conn._resolver._cache[("horizon.meta.com", 0, 0)] = (
-                0, [{"hostname": "horizon.meta.com", "host": _ip, "port": 443,
-                     "family": 2, "proto": 0, "flags": 0}])
-            except: pass
         session = aiohttp.ClientSession(connector=conn, headers=_hdrs,
                                         timeout=_timeout, connector_owner=True)
 
-        # Log queue — AVAILABLE fires immediately; noisy logs batched every 50ms
         _log_q: collections.deque = collections.deque()
 
         async def _log_drain():
@@ -798,7 +793,6 @@ class Engine:
                     msg, tag = _log_q.popleft()
                     self.on_log(msg, tag)
 
-        # Stats coroutine — every 250ms, not on every single check
         t_start = time.perf_counter()
 
         async def _stats_loop():
@@ -809,29 +803,34 @@ class Engine:
                 self._cycle = self._total_checks // max(len(names), 1)
                 self.on_stats(self._cycle, self._found, 0, cps, self._total_checks)
 
-        # Per-name worker: keeps CONCUR requests in-flight simultaneously.
-        # Semaphore acquired before task creation, released inside _check.
-        async def _worker(name):
-            sem = asyncio.Semaphore(CONCUR)
+        # One shared cursor; every worker pulls the next name, so each name is
+        # hit as often as the pipe allows with no per-request task/semaphore churn.
+        idx = [0]
+        n_names = len(names)
+
+        async def _worker():
             while self.running:
                 while self.paused and self.running: await asyncio.sleep(0.02)
                 if not self.running: break
-                await sem.acquire()
-                if not self.running: sem.release(); break
-                asyncio.create_task(self._check(session, name, sem, _log_q))
+                wait = self._throttled_until - time.perf_counter()
+                if wait > 0: await asyncio.sleep(min(wait, 0.5)); continue
+                i = idx[0]; idx[0] += 1
+                if not loop_mode and i >= n_names: break
+                await self._check(session, names[i % n_names], _log_q)
                 self._total_checks += 1
-                if not loop_mode:
-                    for _ in range(CONCUR): await sem.acquire()  # drain in-flight
-                    break
 
         try:
             self.on_status("running")
-            worker_tasks = [asyncio.create_task(_worker(n)) for n in names]
+            self._throttled_until = 0.0; self._backoff = 0.5
             bg_tasks = [asyncio.create_task(_log_drain()),
                         asyncio.create_task(_stats_loop())]
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            # Warm every pooled connection first (cold TLS handshake is ~500ms).
+            await asyncio.gather(*[self._head(session, names[0]) for _ in range(conc)],
+                                 return_exceptions=True)
+            workers = [asyncio.create_task(_worker()) for _ in range(conc)]
+            await asyncio.gather(*workers, return_exceptions=True)
+            self.running = False
             for t in bg_tasks: t.cancel()
-            # Final drain
             while _log_q:
                 msg, tag = _log_q.popleft(); self.on_log(msg, tag)
         finally:
@@ -839,34 +838,58 @@ class Engine:
             except: pass
         self.running = False; self.on_status("stopped"); self.on_log("stopped", "info")
 
-    async def _check(self, session, name, sem: asyncio.Semaphore, log_q: collections.deque):
+    async def _head(self, session, name):
+        """One existence probe. HEAD + no redirect-follow: ~100ms, 0KB body."""
         url = f"https://horizon.meta.com/profile/{name}/"
+        async with session.head(url, allow_redirects=False) as r:
+            return parse_status(r.status, r.headers.get("Location", ""), url, name)
+
+    async def _verify(self, session, name):
+        """A bounce means 'no such profile' OR 'you are throttled'. Re-probe the name
+        and a known-existing canary in parallel (one round trip). Only a repeat bounce
+        with a canary that still resolves is a real AVAILABLE."""
+        seed = self.cfg.get("canary")
+        pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
+        if not pool: return False   # nothing known-good to compare against: can't confirm
+        res = await asyncio.gather(self._head(session, name), self._head(session, pool[-1]),
+                                   return_exceptions=True)
+        again = res[0]
+        if res[1] != "TAKEN":
+            # Canary stopped resolving -> we are being throttled; back off, discard.
+            self._throttled_until = time.perf_counter() + self._backoff
+            self._backoff = min(self._backoff * 2, 10.0)
+            return False
+        self._backoff = 0.5
+        return again == "AVAILABLE"
+
+    async def _check(self, session, name, log_q: collections.deque):
         t = time.perf_counter()
         try:
-            async with session.get(url, allow_redirects=False) as r:
-                el = time.perf_counter() - t
-                status = parse_status(r.status, r.headers.get("Location", ""), str(r.url), name)
-                ms = f"{el*1000:.0f}ms"
-                if status == "AVAILABLE":
-                    # Fire snipe FIRST — every microsecond matters in a swap window.
-                    # Log after so the callback chain doesn't add latency before submit.
-                    if name not in self._cache:
-                        self._cache.add(name); self._found += 1; self._alert(name)
-                    self.on_log(f"AVAILABLE  {name:<22} {ms}", "available")
-                elif status == "RATE":
-                    log_q.append((f"RATE       {name:<22}", "warn"))
-                elif status == "TAKEN":
-                    log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
-                else:
-                    log_q.append((f"UNKNOWN    {name:<22} {ms}", "unknown"))
+            status = await self._head(session, name)
+            ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
+            if status == "TAKEN":
+                if name not in self._canaries: self._canaries.append(name)
+                self._cache.discard(name)   # re-arm: alert again if it frees later
+                log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
+            elif status == "AVAILABLE":
+                if name in self._cache: return
+                if not await self._verify(session, name):
+                    log_q.append((f"THROTTLED  {name:<22} bounce unconfirmed", "warn")); return
+                if name not in self._cache:
+                    self._cache.add(name); self._found += 1; self._alert(name)
+                self.on_log(f"AVAILABLE  {name:<22} {ms}", "available")
+            elif status == "RATE":
+                self._throttled_until = time.perf_counter() + self._backoff
+                self._backoff = min(self._backoff * 2, 10.0)
+                log_q.append((f"RATE       {name:<22}", "warn"))
+            else:
+                log_q.append((f"UNKNOWN    {name:<22} {ms}", "unknown"))
         except asyncio.TimeoutError:
             log_q.append((f"TIMEOUT    {name:<22}", "timeout"))
         except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError):
             log_q.append((f"CONN ERR   {name:<22}", "timeout"))
         except Exception as e:
             log_q.append((f"ERROR      {name}  {e}", "err"))
-        finally:
-            sem.release()  # always release so the worker can fire the next request
 
     def _alert(self, name):
         cfg = self.cfg
