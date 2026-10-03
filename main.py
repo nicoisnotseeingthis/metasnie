@@ -710,6 +710,10 @@ class Engine:
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
         self._suppress = {}
+        self._fires, self._fired = collections.deque(), set()
+        self._confirm_sem = None
+        self._case_q, self._case_timer = [], None
+        self._case_lock = threading.Lock()
         self._names, self._list_path, self.on_rename = [], "", None
         self._rename_lock = threading.Lock()
         self._timeouts = 0
@@ -809,6 +813,7 @@ class Engine:
                     self._limit = min(conc, self._limit + 1)
 
         self._names, self._list_path = names, path
+        self._confirm_sem = asyncio.Semaphore(3)
         pr = os.environ.get("PROXIES") or cfg.get("proxies") or ""
         proxies = [p.strip() for p in (pr if isinstance(pr, list) else pr.split(",")) if p and p.strip()]
         if proxies: self.on_log(f"{len(proxies)} proxies, workers pinned round-robin", "info")
@@ -876,6 +881,7 @@ class Engine:
         return res[:cap]
 
     async def _confirm(self, session, name, ms, log_q):
+      async with self._confirm_sem:
         try:
             seed = self.cfg.get("canary")
             pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
@@ -901,6 +907,8 @@ class Engine:
                     return
             if again != "AVAILABLE":
                 self._cache.discard(name); return
+            if name not in self._fired:
+                self._fired.add(name); self._fire(name)
             self._found += 1
             self._notify(name)
             self.on_log(f"AVAILABLE  {name:<22} {ms} (confirmed)", "available")
@@ -916,15 +924,15 @@ class Engine:
             ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
             if status == "TAKEN":
                 if name not in self._canaries: self._canaries.append(name)
-                self._cache.discard(name)
+                self._cache.discard(name); self._fired.discard(name)
                 log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
             elif status == "AVAILABLE":
                 if name in self._cache: return
                 if self._suppress.get(name, 0) > time.perf_counter(): return
                 self._cache.add(name)
 
-                if time.perf_counter() >= self._throttled_until:
-                    self._fire(name)
+                if time.perf_counter() >= self._throttled_until and self._fire_budget():
+                    self._fired.add(name); self._fire(name)
                 asyncio.create_task(self._confirm(session, name, ms, log_q))
             elif status == "RATE":
                 self._throttled_until = time.perf_counter() + self._backoff
@@ -940,6 +948,12 @@ class Engine:
             self._timeouts += 1
         except Exception as e:
             log_q.append((f"ERROR      {name}  {e}", "err"))
+
+    def _fire_budget(self):
+        now = time.perf_counter()
+        while self._fires and now - self._fires[0] > 60: self._fires.popleft()
+        if len(self._fires) >= int(self.cfg.get("max_unverified_fires", 6)): return False
+        self._fires.append(now); return True
 
     def _fire(self, name):
         DETECT_T[name] = time.perf_counter()
@@ -965,11 +979,26 @@ class Engine:
     def _notify_case(self, name, variant):
         cfg = self.cfg
         if not (cfg.get("webhook_enabled") and cfg.get("webhook_url") and _requests): return
-        msg = f"`@{name}` changed to `@{variant}` — https://horizon.meta.com/profile/{variant}/"
-        def _send(url=cfg["webhook_url"]):
-            try: _requests.post(url, json={"content": msg}, timeout=4)
-            except: pass
-        threading.Thread(target=_send, daemon=True).start()
+        with self._case_lock:
+            self._case_q.append((name, variant))
+            if self._case_timer is None:
+                self._case_timer = threading.Timer(float(cfg.get("case_flush", 30)), self._flush_case)
+                self._case_timer.daemon = True; self._case_timer.start()
+
+    def _flush_case(self):
+        with self._case_lock:
+            items, self._case_q, self._case_timer = self._case_q, [], None
+        if not items: return
+        url = self.cfg["webhook_url"]
+        lines = [f"`@{o}` changed to `@{n}`" for o, n in items]
+        chunk = ""
+        for ln in lines + [None]:
+            if ln is None or len(chunk) + len(ln) + 1 > 1800:
+                if chunk:
+                    try: _requests.post(url, json={"content": chunk}, timeout=4)
+                    except: pass
+                chunk = ""
+            if ln: chunk += ln + "\n"
 
     def _notify(self, name):
         cfg = self.cfg

@@ -221,9 +221,13 @@ engine = M.Engine(CFG, log, on_status, on_found, on_stats, on_snipe)
 _git_lock = threading.Lock()
 
 
-def on_rename(old, new):
-    if not os.environ.get("GITHUB_ACTIONS"):
-        return
+_rn = {"n": 0, "timer": None}
+_rn_lock = threading.Lock()
+
+
+def _push_list():
+    with _rn_lock:
+        n, _rn["n"], _rn["timer"] = _rn["n"], 0, None
     with _git_lock:
         g = ["git", "-c", "user.name=bot", "-c", "user.email=bot@users.noreply.github.com"]
         try:
@@ -232,9 +236,20 @@ def on_rename(old, new):
             if subprocess.run(g + ["pull", "--rebase", "origin", "main"], timeout=60).returncode:
                 subprocess.run(g + ["rebase", "--abort"], timeout=30)
             subprocess.run(g + ["push", "origin", "HEAD:main"], check=True, timeout=60)
-            log(f"list updated: {old} -> {new}", "info")
+            log(f"list updated ({n} changes)", "info")
         except Exception as e:
             log(f"list update not pushed: {e}", "warn")
+
+
+def on_rename(old, new):
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    with _rn_lock:
+        _rn["n"] += 1
+        if _rn["timer"] is None:
+            _rn["timer"] = threading.Timer(120, _push_list)
+            _rn["timer"].daemon = True
+            _rn["timer"].start()
 
 
 engine.on_rename = on_rename
