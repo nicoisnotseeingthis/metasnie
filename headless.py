@@ -54,7 +54,12 @@ if not NAMES:
 
 MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME", "0"))
 
+_QUIET = {"taken", "timeout", "unknown"}
+
+
 def log(msg, tag="info"):
+    if tag in _QUIET:
+        return
     print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
 def send_hook(content):
@@ -171,7 +176,9 @@ last_stats = [0.0]
 def on_stats(cycle, found, ms, cps, checked):
     now = time.time()
     if now - last_stats[0] > 2:
-        log(f"cycle {cycle} | found {found} | cps {cps:.0f} | checked {checked}", "stats")
+        eng = globals().get("engine")
+        extra = f" | limit {eng._limit} | timeouts {eng._timeouts} ({eng._to_frac*100:.0f}%)" if eng else ""
+        log(f"cycle {cycle} | found {found} | cps {cps:.0f} | checked {checked}{extra}", "stats")
         last_stats[0] = now
 
 def on_status(s):

@@ -697,6 +697,8 @@ class Engine:
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
         self._suppress = {}
+        self._timeouts = 0
+        self._limit, self._to_frac = 0, 0.0
         self._case_seen = {}
         self._throttle_events = self._false_pos = 0
         self._snipe_ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="fire")
@@ -731,11 +733,15 @@ class Engine:
 
         tc = float(cfg.get("timeout_total", 0) or 0)
         cc = float(cfg.get("timeout_connect", 0) or 0)
-        tc = tc if 0 < tc <= 10 else 3.0
-        cc = cc if 0 < cc <= 10 else 2.0
+        tc = tc if 0 < tc <= 10 else 1.5
+        cc = cc if 0 < cc <= 10 else 1.0
 
         conc = int(cfg.get("concurrency", 0) or 0)
         conc = conc if 0 < conc <= 512 else 64
+        min_conc = max(1, int(cfg.get("min_concurrency", 8) or 8))
+        self._limit = min(conc, max(min_conc, 24))
+        self._pause_until = 0.0
+        self._win_ok = self._win_to = 0
         loop_mode = cfg.get("loop_mode", True)
         self.on_log(f"{len(names)} names — HEAD x{conc} in flight, {tc}s timeout", "info")
 
@@ -762,18 +768,37 @@ class Engine:
         t_start = time.perf_counter()
 
         async def _stats_loop():
+            last_t, last_n = time.perf_counter(), 0
             while self.running:
                 await asyncio.sleep(0.25)
-                el = time.perf_counter() - t_start
-                cps = self._total_checks / el if el > 0 else 0
+                now = time.perf_counter()
+                cps = (self._total_checks - last_n) / max(now - last_t, 1e-6)
+                last_t, last_n = now, self._total_checks
                 self._cycle = self._total_checks // max(len(names), 1)
                 self.on_stats(self._cycle, self._found, 0, cps, self._total_checks)
+
+        async def _adapt():
+            while self.running:
+                await asyncio.sleep(1.0)
+                ok, to = self._win_ok, self._win_to
+                self._win_ok = self._win_to = 0
+                n = ok + to
+                self._to_frac = to / n if n else 0.0
+                if n == 0: continue
+                if self._to_frac > 0.5:
+                    self._limit = max(min_conc, int(self._limit * 0.7))
+                elif self._to_frac > 0.1:
+                    self._limit = max(min_conc, int(self._limit * 0.9))
+                else:
+                    self._limit = min(conc, self._limit + 1)
 
         idx = [0]
         n_names = len(names)
 
-        async def _worker():
+        async def _worker(k):
             while self.running:
+                if k >= self._limit or time.perf_counter() < self._pause_until:
+                    await asyncio.sleep(0.02); continue
                 while self.paused and self.running: await asyncio.sleep(0.02)
                 if not self.running: break
                 wait = self._throttled_until - time.perf_counter()
@@ -787,11 +812,12 @@ class Engine:
             self.on_status("running")
             self._throttled_until = 0.0; self._backoff = 0.5
             bg_tasks = [asyncio.create_task(_log_drain()),
-                        asyncio.create_task(_stats_loop())]
+                        asyncio.create_task(_stats_loop()),
+                        asyncio.create_task(_adapt())]
 
-            await asyncio.gather(*[self._head(session, names[0]) for _ in range(conc)],
+            await asyncio.gather(*[self._head(session, names[0]) for _ in range(self._limit)],
                                  return_exceptions=True)
-            workers = [asyncio.create_task(_worker()) for _ in range(conc)]
+            workers = [asyncio.create_task(_worker(k)) for k in range(conc)]
             await asyncio.gather(*workers, return_exceptions=True)
             self.running = False
             for t in bg_tasks: t.cancel()
@@ -863,6 +889,7 @@ class Engine:
         t = time.perf_counter()
         try:
             status = await self._head(session, name)
+            self._win_ok += 1
             ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
             if status == "TAKEN":
                 if name not in self._canaries: self._canaries.append(name)
@@ -883,9 +910,11 @@ class Engine:
             else:
                 log_q.append((f"UNKNOWN    {name:<22} {ms}", "unknown"))
         except asyncio.TimeoutError:
-            log_q.append((f"TIMEOUT    {name:<22}", "timeout"))
+            self._win_to += 1
+            self._timeouts += 1
         except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError):
-            log_q.append((f"CONN ERR   {name:<22}", "timeout"))
+            self._win_to += 1
+            self._timeouts += 1
         except Exception as e:
             log_q.append((f"ERROR      {name}  {e}", "err"))
 
