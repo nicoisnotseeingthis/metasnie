@@ -7,8 +7,6 @@ on:
     paths-ignore:
       - 'README.md'
       - '.gitignore'
-  schedule:
-    - cron: '0 */5 * * *'
 
 concurrency:
   group: op-checker

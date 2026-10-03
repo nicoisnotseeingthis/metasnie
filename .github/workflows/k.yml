@@ -1,0 +1,28 @@
+name: k
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  k:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start if nothing is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          n=0
+          for s in in_progress queued pending waiting requested; do
+            c=$(gh run list --workflow op_checker.yml --status $s --json databaseId --jq length)
+            n=$((n + c))
+          done
+          if [ "$n" -eq 0 ]; then
+            gh workflow run op_checker.yml --ref main
+          fi
