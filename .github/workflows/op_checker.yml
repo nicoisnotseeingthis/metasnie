@@ -14,6 +14,9 @@ concurrency:
   group: op-checker
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import subprocess
 import threading
 import types
 
@@ -201,6 +202,26 @@ log(
 M.refresh_account_usernames(on_log=log)
 
 engine = M.Engine(CFG, log, on_status, on_found, on_stats, on_snipe)
+_git_lock = threading.Lock()
+
+
+def on_rename(old, new):
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    with _git_lock:
+        g = ["git", "-c", "user.name=bot", "-c", "user.email=bot@users.noreply.github.com"]
+        try:
+            subprocess.run(g + ["add", LIST], check=True, timeout=30)
+            subprocess.run(g + ["commit", "-m", "update list"], check=True, timeout=30)
+            if subprocess.run(g + ["pull", "--rebase", "origin", "main"], timeout=60).returncode:
+                subprocess.run(g + ["rebase", "--abort"], timeout=30)
+            subprocess.run(g + ["push", "origin", "HEAD:main"], check=True, timeout=60)
+            log(f"list updated: {old} -> {new}", "info")
+        except Exception as e:
+            log(f"list update not pushed: {e}", "warn")
+
+
+engine.on_rename = on_rename
 engine.start()
 if time.time() - stats["since"] >= REPORT_EVERY:
     flush_stats()
