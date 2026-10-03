@@ -16,5 +16,9 @@
   "opacity": 1.0,
   "preset": "Custom",
   "log_filter": "all",
-  "snipe_cred_index": 0
+  "snipe_cred_index": 0,
+  "snipe_burst": 3,
+  "snipe_rounds": 12,
+  "snipe_interval": 0.05,
+  "report_hours": 4
 }

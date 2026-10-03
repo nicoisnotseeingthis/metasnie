@@ -34,9 +34,23 @@ jobs:
             echo "$CREDS_JSON" > creds/creds.json
           fi
 
+      - name: Restore update-report stats
+        uses: actions/cache/restore@v4
+        with:
+          path: state/stats.json
+          key: stats-${{ github.run_id }}
+          restore-keys: stats-
+
       - name: Run headless checker
         env:
           # 5 hours 30 minutes in seconds
           MAX_RUNTIME: '19800'
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python headless.py
+
+      - name: Save update-report stats
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state/stats.json
+          key: stats-${{ github.run_id }}

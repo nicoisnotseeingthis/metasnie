@@ -207,12 +207,14 @@ class SniperPool:
         self._lock = threading.Lock()
         self._on_log = None
         self._failed_warm: list = []
+        self._cfg: dict = {}
         # In-memory mirror of per-account status — eliminates disk read on hot path.
         # Keyed by account index; updated atomically by _set_state().
         self._state: dict[int, dict] = {}
 
     def start(self, on_log=None):
         self._on_log = on_log
+        self._cfg = cfg_load()
         self._rebuild()
         # Start background refresher
         self._refresh_stop.clear()
@@ -272,7 +274,7 @@ class SniperPool:
             if self._pool:
                 try: self._pool.shutdown(wait=False, cancel_futures=True)
                 except: self._pool.shutdown(wait=False)
-            n = max(len(entries), 1)
+            n = max(len(entries), 1) * max(1, int(self._cfg.get('snipe_burst', 3))) * 4
             self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=n, thread_name_prefix="snipe")
 
         ok_n = len(entries) - len(failed)
@@ -376,19 +378,24 @@ class SniperPool:
         if not snipers:
             log("snipe: no available accounts (all locked/rate-limited/used)", "warn"); return
 
-        log(f"FIRING {len(snipers)} accounts simultaneously for '{name}'", "snipe")
+        burst  = max(1, int(self._cfg.get("snipe_burst", 3)))      # parallel shots per account per round
+        rounds = max(1, int(self._cfg.get("snipe_rounds", 12)))    # rounds before giving up
+        gap    = float(self._cfg.get("snipe_interval", 0.05))      # seconds between rounds
+        log(f"FIRING {len(snipers)} accounts x{burst} every {int(gap*1000)}ms for '{name}'", "snipe")
 
-        winner = [None]
+        won = threading.Event()
         winner_lock = threading.Lock()
+        logged = set()
 
         def _attempt(entry):
             idx, c, sniper = entry
+            if won.is_set(): return
             uname = c.get('username') or c['PROFILE_ID'][:8]
-            result = sniper.change(name)
+            result = sniper.change(name, retries=1, retry_delay=0)
             if result.get('success'):
                 with winner_lock:
-                    if winner[0] is None:
-                        winner[0] = idx
+                    if not won.is_set():
+                        won.set()
                         self._set_state(idx, 'sniped', name)
                         self._set_state(idx, 'username', name)
                         self._set_state(idx, 'locked', True)
@@ -401,13 +408,24 @@ class SniperPool:
                         threading.Thread(target=_confirm, daemon=True).start()
             else:
                 err = result.get('error', 'unknown')
-                log(f"account {idx+1} ({uname}): {err}", "err")
+                if idx not in logged:            # one line per account, not one per shot
+                    logged.add(idx); log(f"account {idx+1} ({uname}): {err}", "err")
                 if any(kw in str(err).lower() for kw in ('rate', 'spam', 'limit', 'block')):
                     self._set_state(idx, 'rate_limited', True)
                     self._set_state(idx, 'rate_limited_since', time.time())
 
-        futures = [pool.submit(_attempt, entry) for entry in snipers]
-        threading.Thread(target=lambda: concurrent.futures.wait(futures), daemon=True).start()
+        def _hammer():
+            # Round 0 goes out immediately; only later rounds wait.
+            for rnd in range(rounds):
+                if won.is_set(): break
+                for entry in snipers:
+                    if self._get_state(entry[0]).get('rate_limited'): continue
+                    for _ in range(burst): pool.submit(_attempt, entry)
+                if rnd < rounds - 1: time.sleep(gap)
+            if not won.is_set():
+                log(f"snipe: '{name}' not claimed after {rounds} rounds", "warn")
+
+        threading.Thread(target=_hammer, daemon=True).start()
 
     def swap_fire(self, name, interval=0.1, duration=5.0, on_log=None):
         """
@@ -732,6 +750,7 @@ class Engine:
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
         self._suppress = {}
+        self._throttle_events = self._false_pos = 0
         self._snipe_ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="fire")
 
     def start(self):
@@ -884,12 +903,12 @@ class Engine:
             if canary == "NOCANARY" or canary != "TAKEN":
                 self._throttled_until = time.perf_counter() + self._backoff
                 self._backoff = min(self._backoff * 2, 10.0)
-                self._cache.discard(name)
+                self._cache.discard(name); self._throttle_events += 1
                 log_q.append((f"THROTTLED  {name:<22} bounce unconfirmed", "warn")); return
             self._backoff = 0.5
             for v, r in zip(variants, var_res):
                 if r == "TAKEN":
-                    self._suppress[name] = time.perf_counter() + 300
+                    self._suppress[name] = time.perf_counter() + 300; self._false_pos += 1
                     log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn")); return
             if again != "AVAILABLE":
                 self._cache.discard(name); return
