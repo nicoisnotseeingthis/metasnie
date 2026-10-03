@@ -43,6 +43,9 @@ CFG["selected_list"] = LIST
 
 os.makedirs("lists", exist_ok=True)
 os.makedirs("creds", exist_ok=True)
+if os.environ.get("CREDS_JSON") and not os.path.exists(os.path.join("creds", "creds.json")):
+    with open(os.path.join("creds", "creds.json"), "w") as _f:
+        _f.write(os.environ["CREDS_JSON"])
 
 if not LIST or not os.path.exists(LIST):
     print(f"[FATAL] list not found: {LIST}", flush=True)
@@ -99,7 +102,8 @@ os.makedirs("state", exist_ok=True)
 
 def _fresh_stats():
     return {"since": time.time(), "checks": 0, "runtime": 0.0, "runs": 0,
-            "found": [], "claims": [], "attempts": 0, "throttled": 0, "false_pos": 0}
+            "found": [], "claims": [], "attempts": 0, "throttled": 0, "false_pos": 0,
+            "timeouts": 0}
 
 try:
     with open(STATS_FILE) as _f:
@@ -126,6 +130,17 @@ def build_report():
         f"Claimed: **{len(stats['claims'])}**" + (f" — {', '.join(f'`{n}`' for n in stats['claims'])}" if stats["claims"] else ""),
         f"Claim attempts: {stats['attempts']} | throttle events: {stats['throttled']} | false positives filtered: {stats['false_pos']}",
     ]
+    eng = globals().get("engine")
+    if eng is not None:
+        lat = sorted(eng._lat)
+        if lat:
+            p50, p95 = lat[len(lat) // 2] * 1000, lat[int(len(lat) * 0.95)] * 1000
+            ans = max(stats["checks"] - stats["timeouts"], 0)
+            tpct = 100 * stats["timeouts"] / max(stats["checks"], 1)
+            lines.append(f"Check latency p50 {p50:.0f}ms / p95 {p95:.0f}ms | answered {ans / max(stats['runtime'], 1):.0f}/s | timeouts {tpct:.0f}% | limit {eng._limit}")
+        if M.CLAIM_LAT:
+            cl = sorted(M.CLAIM_LAT)
+            lines.append(f"Detect to first claim: median {cl[len(cl) // 2]:.1f}ms, worst {cl[-1]:.1f}ms ({len(cl)} shots)")
     return "\n".join(lines)
 
 def post_report():
@@ -135,16 +150,17 @@ def post_report():
     stats.clear(); stats.update(_fresh_stats()); stats["runs"] = 1
     save_stats()
 
-_seen = {"checks": 0, "t": time.time(), "thr": 0, "fp": 0}
+_seen = {"checks": 0, "t": time.time(), "thr": 0, "fp": 0, "to": 0}
 
 def flush_stats(final=False):
     eng = globals().get("engine")
     now = time.time()
     if eng is not None:
         stats["checks"] += max(eng._total_checks - _seen["checks"], 0)
+        stats["timeouts"] += max(eng._timeouts - _seen["to"], 0)
         stats["throttled"] += max(eng._throttle_events - _seen["thr"], 0)
         stats["false_pos"] += max(eng._false_pos - _seen["fp"], 0)
-        _seen.update(checks=eng._total_checks, thr=eng._throttle_events, fp=eng._false_pos)
+        _seen.update(checks=eng._total_checks, thr=eng._throttle_events, fp=eng._false_pos, to=eng._timeouts)
     stats["runtime"] += now - _seen["t"]
     _seen["t"] = now
     save_stats()
