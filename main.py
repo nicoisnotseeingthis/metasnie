@@ -697,6 +697,8 @@ class Engine:
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
         self._suppress = {}
+        self._names, self._list_path, self.on_rename = [], "", None
+        self._rename_lock = threading.Lock()
         self._timeouts = 0
         self._limit, self._to_frac = 0, 0.0
         self._case_seen = {}
@@ -792,6 +794,7 @@ class Engine:
                 else:
                     self._limit = min(conc, self._limit + 1)
 
+        self._names, self._list_path = names, path
         idx = [0]
         n_names = len(names)
 
@@ -876,6 +879,7 @@ class Engine:
                     log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn"))
                     if self._case_seen.get(name) != v:
                         self._case_seen[name] = v; self._notify_case(name, v)
+                        self._apply_rename(name, v)
                     return
             if again != "AVAILABLE":
                 self._cache.discard(name); return
@@ -921,6 +925,22 @@ class Engine:
     def _fire(self, name):
         if self.cfg.get("snipe_mode", False):
             self._snipe_ex.submit(self.on_snipe, name)
+
+    def _apply_rename(self, old, new):
+        with self._rename_lock:
+            for i, n in enumerate(self._names):
+                if n == old: self._names[i] = new
+            try:
+                with open(self._list_path, encoding="utf-8") as f:
+                    rows = [l.rstrip("\n") for l in f]
+                rows = [new if r.strip() == old else r for r in rows]
+                with open(self._list_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(rows) + "\n")
+            except Exception:
+                pass
+        self._cache.discard(old)
+        if self.on_rename:
+            threading.Thread(target=self.on_rename, args=(old, new), daemon=True).start()
 
     def _notify_case(self, name, variant):
         cfg = self.cfg
