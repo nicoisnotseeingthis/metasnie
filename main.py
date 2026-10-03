@@ -750,6 +750,7 @@ class Engine:
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
         self._suppress = {}
+        self._case_seen = {}
         self._throttle_events = self._false_pos = 0
         self._snipe_ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="fire")
 
@@ -909,7 +910,10 @@ class Engine:
             for v, r in zip(variants, var_res):
                 if r == "TAKEN":
                     self._suppress[name] = time.perf_counter() + 300; self._false_pos += 1
-                    log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn")); return
+                    log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn"))
+                    if self._case_seen.get(name) != v:      # tell Discord once per change
+                        self._case_seen[name] = v; self._notify_case(name, v)
+                    return
             if again != "AVAILABLE":
                 self._cache.discard(name); return
             self._found += 1
@@ -954,6 +958,15 @@ class Engine:
         """Hand the claim to a worker thread so the event loop never blocks on it."""
         if self.cfg.get("snipe_mode", False):
             self._snipe_ex.submit(self.on_snipe, name)
+
+    def _notify_case(self, name, variant):
+        cfg = self.cfg
+        if not (cfg.get("webhook_enabled") and cfg.get("webhook_url") and _requests): return
+        msg = f"`@{name}` changed to `@{variant}` — https://horizon.meta.com/profile/{variant}/"
+        def _send(url=cfg["webhook_url"]):
+            try: _requests.post(url, json={"content": msg}, timeout=4)
+            except: pass
+        threading.Thread(target=_send, daemon=True).start()
 
     def _notify(self, name):
         cfg = self.cfg
