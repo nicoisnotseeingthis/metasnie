@@ -1,8 +1,3 @@
-"""
-Headless runner for the Meta Horizon username checker.
-Imports main.py with a tkinter stub so the same checking, refreshing,
-claiming and webhook logic runs without a GUI inside GitHub Actions.
-"""
 import os
 import sys
 import time
@@ -10,22 +5,15 @@ import json
 import threading
 import types
 
-# Make sure main.py (same folder) is importable
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# ---------------------------------------------------------------------------
-# tkinter stub so main.py loads on a headless Linux/GitHub runner
-# ---------------------------------------------------------------------------
 _tk = types.ModuleType("tkinter")
 _tk.__path__ = []
 
-
 def _make_dummy(name):
-    """Return a do-nothing class for any missing tkinter symbol."""
     return type(name, (), {})
-
 
 def _tk_getattr(name):
     if name in ("ttk", "filedialog", "messagebox"):
@@ -38,23 +26,17 @@ def _tk_getattr(name):
         return sys.modules[full]
     return _make_dummy(name)
 
-
 _tk.__getattr__ = _tk_getattr
 sys.modules["tkinter"] = _tk
 
-# ---------------------------------------------------------------------------
-# Load main.py's logic unchanged
-# ---------------------------------------------------------------------------
 import main as M
 
 CFG = M.cfg_load()
 
-# Allow secret override of the webhook URL
 if os.environ.get("WEBHOOK_URL"):
     CFG["webhook_url"] = os.environ["WEBHOOK_URL"]
     CFG["webhook_enabled"] = True
 
-# Normalize Windows backslashes for Linux runners
 LIST = CFG.get("selected_list", "").replace("\\", "/")
 CFG["selected_list"] = LIST
 
@@ -72,13 +54,10 @@ if not NAMES:
 
 MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME", "0"))
 
-
 def log(msg, tag="info"):
     print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
-
 def send_hook(content):
-    """Post to Discord. allowed_mentions is required to actually ping @everyone."""
     if not CFG.get("webhook_enabled") or not CFG.get("webhook_url"):
         return
     try:
@@ -95,7 +74,6 @@ def send_hook(content):
     except Exception:
         pass
 
-
 def send_available(name):
     tpl = CFG.get(
         "webhook_template",
@@ -103,26 +81,19 @@ def send_available(name):
     )
     send_hook(tpl.format(name=name))
 
-
 def send_claimed(name, acct=""):
     send_hook(
         f"@everyone **Successfully claimed `{name}`!** (acct: {acct}) — "
         f"https://horizon.meta.com/profile/{name}/"
     )
 
-
-# ---------------------------------------------------------------------------
-# Periodic report (every REPORT_HOURS, default 4): stats persist in state/stats.json (cached between Actions runs)
-# ---------------------------------------------------------------------------
 REPORT_EVERY = float(os.environ.get("REPORT_HOURS") or CFG.get("report_hours", 4)) * 3600
 STATS_FILE = os.path.join("state", "stats.json")
 os.makedirs("state", exist_ok=True)
 
-
 def _fresh_stats():
     return {"since": time.time(), "checks": 0, "runtime": 0.0, "runs": 0,
             "found": [], "claims": [], "attempts": 0, "throttled": 0, "false_pos": 0}
-
 
 try:
     with open(STATS_FILE) as _f:
@@ -131,14 +102,12 @@ except Exception:
     stats = _fresh_stats()
 stats["runs"] += 1
 
-
 def save_stats():
     try:
         with open(STATS_FILE, "w") as f:
             json.dump(stats, f)
     except Exception:
         pass
-
 
 def build_report():
     hrs = max((time.time() - stats["since"]) / 3600, 0.01)
@@ -153,7 +122,6 @@ def build_report():
     ]
     return "\n".join(lines)
 
-
 def post_report():
     msg = build_report()
     log(msg.replace("\n", " | "), "report")
@@ -161,9 +129,7 @@ def post_report():
     stats.clear(); stats.update(_fresh_stats()); stats["runs"] = 1
     save_stats()
 
-
 _seen = {"checks": 0, "t": time.time(), "thr": 0, "fp": 0}
-
 
 def flush_stats(final=False):
     eng = globals().get("engine")
@@ -180,20 +146,14 @@ def flush_stats(final=False):
         os.environ.pop("REPORT_NOW", None)
         post_report()
 
-
 def _stats_thread():
     while True:
         time.sleep(60)
         flush_stats()
 
-
 threading.Thread(target=_stats_thread, daemon=True).start()
 
-# ---------------------------------------------------------------------------
-# Patch the sniper so a successful claim immediately sends the @everyone webhook
-# ---------------------------------------------------------------------------
 _orig_change = M.MetaUsernameSniper.change
-
 
 def _patched_change(self, name, retries=3, retry_delay=0.15):
     res = _orig_change(self, name, retries, retry_delay)
@@ -204,14 +164,9 @@ def _patched_change(self, name, retries=3, retry_delay=0.15):
         send_claimed(name, acct)
     return res
 
-
 M.MetaUsernameSniper.change = _patched_change
 
-# ---------------------------------------------------------------------------
-# Engine callbacks
-# ---------------------------------------------------------------------------
 last_stats = [0.0]
-
 
 def on_stats(cycle, found, ms, cps, checked):
     now = time.time()
@@ -219,31 +174,23 @@ def on_stats(cycle, found, ms, cps, checked):
         log(f"cycle {cycle} | found {found} | cps {cps:.0f} | checked {checked}", "stats")
         last_stats[0] = now
 
-
 def on_status(s):
     log(f"status: {s}", "info")
-
 
 def on_found(name):
     log(f"FOUND {name}", "available")
     stats["found"].append(name)
 
-
 def on_snipe(name):
     log(f"SNIPE {name}", "snipe")
     M.snipe_claim(name, on_log=log)
 
-
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
 log(
     f"loaded {len(NAMES)} names | snipe={CFG.get('snipe_mode', False)} | "
     f"webhook={CFG.get('webhook_enabled', False)}",
     "info",
 )
 
-# Same refresh as the manual "Refresh" button in the GUI
 M.refresh_account_usernames(on_log=log)
 
 engine = M.Engine(CFG, log, on_status, on_found, on_stats, on_snipe)

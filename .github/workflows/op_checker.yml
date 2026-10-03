@@ -1,19 +1,22 @@
-name: OP Checker
+name: run
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
   schedule:
-    # restart every 5 hours so it runs continuously as close to 24/7 as GitHub allows
     - cron: '0 */5 * * *'
 
 concurrency:
   group: op-checker
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    # GitHub hard-caps each job at 6 hours; stop just before that
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +46,6 @@ jobs:
 
       - name: Run headless checker
         env:
-          # 5 hours 30 minutes in seconds
           MAX_RUNTIME: '19800'
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python headless.py

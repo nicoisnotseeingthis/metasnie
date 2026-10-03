@@ -1,6 +1,3 @@
-"""
-Meta Horizon Username Checker
-"""
 import aiohttp
 import asyncio
 import collections
@@ -41,8 +38,7 @@ def _hsv(h, s, v):
     return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
 def _build_palette(hue, sat):
-    # atmosphere colors shift with hue
-    # functional colors (text, green, red, etc) stay constant
+
     return {
         "bg":         _hsv(hue, 0.10, 0.04),
         "panel":      _hsv(hue, 0.15, 0.10),
@@ -82,7 +78,7 @@ FONT_LBL  = ("Segoe UI", 9)
 FONT_STAT = ("Consolas", 10, "bold")
 FONT_TINY = ("Consolas", 6)
 
-BD = 2  # global border width
+BD = 2
 
 CFG_FILE = "checker_config.json"
 CFG_DEF  = {
@@ -139,9 +135,6 @@ def parse_status(code, location, final_url, name):
     if code == 429: return "RATE"
     return "UNKNOWN"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CREDS
-# ═══════════════════════════════════════════════════════════════════════════════
 CREDS_DIR = "creds"
 CREDS_FILE = os.path.join(CREDS_DIR, "creds.json")
 
@@ -181,23 +174,14 @@ def creds_update(index, key, value):
     data = creds_load()
     if 0 <= index < len(data): data[index][key] = value; creds_save(data)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GRAPHQL SNIPER
-# ═══════════════════════════════════════════════════════════════════════════════
 API_URL = 'https://accountscenter.meta.com/api/graphql/'
 TOKEN_CACHE = {}
 TOKEN_CACHE_LOCK = threading.Lock()
-RATE_LIMIT_COOLDOWN = 90   # seconds — Meta rate limits typically clear in 30–120s
+RATE_LIMIT_COOLDOWN = 90
 
-# ── Sniper Pool ───────────────────────────────────────────────────────────────
-# Pre-initializes everything so fire() has zero startup cost:
-#   - Persistent MetaUsernameSniper instances (warm sessions, pre-built payloads)
-#   - Live ThreadPoolExecutor (no creation cost at snipe time)
-#   - Background token refresher keeps payloads always current
-# When AVAILABLE fires → fire() is a single .submit() call, nothing else.
 class SniperPool:
-    REFRESH_INTERVAL = 210  # seconds — full rebuild of all accounts every 3.5 min
-    RETRY_INTERVAL   = 30   # seconds — retry only failed-token accounts every 30s
+    REFRESH_INTERVAL = 210
+    RETRY_INTERVAL   = 30
 
     def __init__(self):
         self._snipers: list[tuple[int, dict, 'MetaUsernameSniper']] = []
@@ -208,15 +192,14 @@ class SniperPool:
         self._on_log = None
         self._failed_warm: list = []
         self._cfg: dict = {}
-        # In-memory mirror of per-account status — eliminates disk read on hot path.
-        # Keyed by account index; updated atomically by _set_state().
+
         self._state: dict[int, dict] = {}
 
     def start(self, on_log=None):
         self._on_log = on_log
         self._cfg = cfg_load()
         self._rebuild()
-        # Start background refresher
+
         self._refresh_stop.clear()
         if not (self._refresh_thread and self._refresh_thread.is_alive()):
             self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
@@ -229,7 +212,6 @@ class SniperPool:
         if self._on_log: self._on_log(msg, tag)
 
     def _rebuild(self):
-        """Load creds, create/reuse sniper instances, warm tokens — all in parallel."""
         if not _requests: return
         creds = creds_load()
         if not creds: return
@@ -240,7 +222,6 @@ class SniperPool:
             if c.get('sniper_enabled', True) and not rl:
                 entries.append((i, c, MetaUsernameSniper(c)))
 
-        # Warm tokens in parallel — track failures for fast retry
         failed = []
         def _warm(entry):
             i, c, sniper = entry
@@ -256,7 +237,6 @@ class SniperPool:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(entries)) as ex:
                 list(ex.map(_warm, entries))
 
-        # Populate in-memory state from the freshly-loaded creds (all accounts, not just active)
         new_state = {}
         for i, c in enumerate(creds):
             new_state[i] = {
@@ -281,7 +261,6 @@ class SniperPool:
         self._log(f"sniper ready — {ok_n}/{len(entries)} accounts with fresh tokens", "info")
 
     def _retry_failed_tokens(self):
-        """Retry only accounts whose last token refresh failed — runs every RETRY_INTERVAL."""
         with self._lock:
             to_retry = list(self._failed_warm)
         if not to_retry: return
@@ -301,7 +280,6 @@ class SniperPool:
             self._failed_warm = still_failed
 
     def _set_state(self, idx, key, value):
-        """Update in-memory state and write through to disk. Zero disk reads on the call side."""
         with self._lock:
             if idx in self._state:
                 self._state[idx][key] = value
@@ -312,7 +290,6 @@ class SniperPool:
             return dict(self._state.get(idx, {}))
 
     def _refresh_loop(self):
-        """Full rebuild every REFRESH_INTERVAL; retry failed-token accounts every RETRY_INTERVAL."""
         next_full = time.time() + self.REFRESH_INTERVAL
         while not self._refresh_stop.wait(self.RETRY_INTERVAL):
             if time.time() >= next_full:
@@ -322,19 +299,12 @@ class SniperPool:
                 self._retry_failed_tokens()
 
     def fire(self, name, on_log=None):
-        """
-        Called the instant AVAILABLE is detected.
-        Cross-references live creds for stale lock/snipe status, then submits
-        all available accounts to the live pool simultaneously.
-        Returns immediately — results arrive via on_log asynchronously.
-        """
         log = on_log or self._on_log or (lambda m, t: None)
 
         with self._lock:
             sniper_map = {c['PROFILE_ID']: (i, c, s) for i, c, s in self._snipers}
             pool = self._pool
 
-        # Pool not ready (startup race) — do one synchronous rebuild, no recursion.
         if not pool:
             if not _requests:
                 log("snipe: requests library not installed", "err"); return
@@ -349,7 +319,6 @@ class SniperPool:
             if not pool:
                 log("snipe: pool still unavailable after rebuild — aborting", "err"); return
 
-        # Use in-memory state — zero disk reads on the hot path
         snipers = []
         skipped_rl = []
         now = time.time()
@@ -365,7 +334,7 @@ class SniperPool:
                 if elapsed < RATE_LIMIT_COOLDOWN:
                     skipped_rl.append((i, int(RATE_LIMIT_COOLDOWN - elapsed)))
                     continue
-                # Cooldown expired — clear and include
+
                 self._set_state(i, 'rate_limited', False)
                 self._set_state(i, 'rate_limited_since', None)
                 log(f"account {i+1}: rate limit cleared, back in rotation", "info")
@@ -378,9 +347,9 @@ class SniperPool:
         if not snipers:
             log("snipe: no available accounts (all locked/rate-limited/used)", "warn"); return
 
-        burst  = max(1, int(self._cfg.get("snipe_burst", 3)))      # parallel shots per account per round
-        rounds = max(1, int(self._cfg.get("snipe_rounds", 12)))    # rounds before giving up
-        gap    = float(self._cfg.get("snipe_interval", 0.05))      # seconds between rounds
+        burst  = max(1, int(self._cfg.get("snipe_burst", 3)))
+        rounds = max(1, int(self._cfg.get("snipe_rounds", 12)))
+        gap    = float(self._cfg.get("snipe_interval", 0.05))
         log(f"FIRING {len(snipers)} accounts x{burst} every {int(gap*1000)}ms for '{name}'", "snipe")
 
         won = threading.Event()
@@ -408,14 +377,14 @@ class SniperPool:
                         threading.Thread(target=_confirm, daemon=True).start()
             else:
                 err = result.get('error', 'unknown')
-                if idx not in logged:            # one line per account, not one per shot
+                if idx not in logged:
                     logged.add(idx); log(f"account {idx+1} ({uname}): {err}", "err")
                 if any(kw in str(err).lower() for kw in ('rate', 'spam', 'limit', 'block')):
                     self._set_state(idx, 'rate_limited', True)
                     self._set_state(idx, 'rate_limited_since', time.time())
 
         def _hammer():
-            # Round 0 goes out immediately; only later rounds wait.
+
             for rnd in range(rounds):
                 if won.is_set(): break
                 for entry in snipers:
@@ -428,15 +397,10 @@ class SniperPool:
         threading.Thread(target=_hammer, daemon=True).start()
 
     def swap_fire(self, name, interval=0.1, duration=5.0, on_log=None):
-        """
-        SWAP MODE — hammers the claim every `interval` seconds for up to `duration` seconds.
-        Does NOT wait for the checker to detect AVAILABLE first. Call this the instant
-        you initiate the swap on your phone so the claim lands the moment the window opens.
-        """
         log = on_log or self._on_log or (lambda m, t: None)
 
         def _run():
-            # Ensure pool is ready
+
             with self._lock:
                 pool = self._pool
                 sniper_map = list(self._snipers)
@@ -450,7 +414,6 @@ class SniperPool:
             if not pool:
                 log("swap: pool unavailable after rebuild", "err"); return
 
-            # Filter using in-memory state — zero disk reads
             snipers = []
             now = time.time()
             for i, _c, sniper in sniper_map:
@@ -516,8 +479,6 @@ class SniperPool:
 
 SNIPER_POOL = SniperPool()
 
-# Persistent per-account sessions — TCP+TLS connections stay alive so
-# the snipe POST has zero handshake overhead when it fires.
 _SNIPE_SESSIONS: dict = {}
 _SNIPE_SESSIONS_LOCK = threading.Lock()
 
@@ -571,7 +532,6 @@ class MetaUsernameSniper:
         except: return False
 
     def _build_cached_headers(self):
-        """Pre-build the static headers so change() does zero dict work at snipe time."""
         if not self.tokens: return
         self._cached_headers = {
             'x-fb-lsd': self.tokens['lsd'],
@@ -581,7 +541,7 @@ class MetaUsernameSniper:
             'referer': self.page_url,
             'origin': 'https://accountscenter.meta.com',
         }
-        # Pre-build the static parts of the POST body (everything except username)
+
         self._base_data = {
             'av': self.profile_id,
             'fb_dtsg': self.tokens['fb_dtsg'],
@@ -595,13 +555,6 @@ class MetaUsernameSniper:
         }
 
     def change(self, username, retries=3, retry_delay=0.05):
-        """
-        Claim `username`. Retries up to `retries` times — critical for swap windows
-        where Meta's servers haven't fully committed the change yet.
-        GENERIC_ERROR / mutation_error_requires_reauth = name already taken or transient
-        server error (snipe was too slow). Treated as a retriable collision, not a session
-        issue — accounts are confirmed working if they can claim other names.
-        """
         if not self.tokens and not self.refresh_tokens():
             return {'success': False, 'error': 'Failed tokens'}
 
@@ -629,14 +582,14 @@ class MetaUsernameSniper:
                 if err_obj:
                     err_str = str(err_obj)
                     last_err = err_str
-                    # Rate / spam — stop immediately, don't burn more attempts
+
                     if any(k in err_str.lower() for k in ('rate', 'spam', 'limit', 'block', 'flood')):
                         return {'success': False, 'error': f'rate_limited: {err_str}'}
-                    # Token errors — refresh once then retry
+
                     if any(k in err_str.lower() for k in ('auth', 'session', 'login', 'token')):
                         if attempt == 0: self.refresh_tokens()
                         time.sleep(retry_delay); continue
-                    # Everything else (GENERIC_ERROR, collision, swap-too-slow) — retry quickly
+
                     if attempt < retries - 1:
                         time.sleep(retry_delay); continue
                     return {'success': False, 'error': err_str}
@@ -678,11 +631,9 @@ class MetaUsernameSniper:
         except Exception as e: return False, str(e)
 
 def snipe_claim(name, on_log=None):
-    """Thin wrapper — delegates to SNIPER_POOL which is already warm and ready."""
     SNIPER_POOL.fire(name, on_log=on_log)
 
 def fetch_horizon_username(profile_id):
-    """Scrape the Meta Horizon profile page to get the current username."""
     if not _requests: return None
     try:
         url = f'https://horizon.meta.com/profile/{profile_id}/?locale=en_US'
@@ -700,7 +651,6 @@ def fetch_horizon_username(profile_id):
     return None
 
 def refresh_account_usernames(on_log=None):
-    """Fetch current usernames from Horizon profile pages for all accounts."""
     if not _requests:
         if on_log: on_log("requests not installed", "err")
         return 0
@@ -738,9 +688,6 @@ def snipe_test_account(idx):
         creds_update(idx, 'rate_limited_since', None)
     return ok, msg
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKER ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
 class Engine:
     def __init__(self, cfg, on_log, on_status, on_found, on_stats, on_snipe):
         self.cfg, self.on_log, self.on_status = cfg, on_log, on_status
@@ -759,7 +706,7 @@ class Engine:
         self.running, self.paused = True, False
         self._cache.clear(); self._found = 0; self._cycle = 0
         self._total_checks = 0
-        SNIPER_POOL.start(on_log=self.on_log)  # pre-warm all snipe sessions & tokens
+        SNIPER_POOL.start(on_log=self.on_log)
         def _go():
             try:
                 import uvloop; uvloop.install()
@@ -782,14 +729,11 @@ class Engine:
         if not names:
             self.on_log("list is empty", "err"); self.running = False; return
 
-        # Sane timeouts: 0 / huge values in old configs mean "hang forever", which
-        # pins a worker slot on a dead socket.
         tc = float(cfg.get("timeout_total", 0) or 0)
         cc = float(cfg.get("timeout_connect", 0) or 0)
         tc = tc if 0 < tc <= 10 else 3.0
         cc = cc if 0 < cc <= 10 else 2.0
-        # Global in-flight cap. Burst tests stayed clean at 64 (~230 names/s); the
-        # old 5-per-name fan-out was 5x the requests for no faster detection.
+
         conc = int(cfg.get("concurrency", 0) or 0)
         conc = conc if 0 < conc <= 512 else 64
         loop_mode = cfg.get("loop_mode", True)
@@ -825,8 +769,6 @@ class Engine:
                 self._cycle = self._total_checks // max(len(names), 1)
                 self.on_stats(self._cycle, self._found, 0, cps, self._total_checks)
 
-        # One shared cursor; every worker pulls the next name, so each name is
-        # hit as often as the pipe allows with no per-request task/semaphore churn.
         idx = [0]
         n_names = len(names)
 
@@ -846,7 +788,7 @@ class Engine:
             self._throttled_until = 0.0; self._backoff = 0.5
             bg_tasks = [asyncio.create_task(_log_drain()),
                         asyncio.create_task(_stats_loop())]
-            # Warm every pooled connection first (cold TLS handshake is ~500ms).
+
             await asyncio.gather(*[self._head(session, names[0]) for _ in range(conc)],
                                  return_exceptions=True)
             workers = [asyncio.create_task(_worker()) for _ in range(conc)]
@@ -861,14 +803,12 @@ class Engine:
         self.running = False; self.on_status("stopped"); self.on_log("stopped", "info")
 
     async def _head(self, session, name):
-        """One existence probe. HEAD + no redirect-follow: ~100ms, 0KB body."""
         url = f"https://horizon.meta.com/profile/{name}/"
         async with session.head(url, allow_redirects=False) as r:
             return parse_status(r.status, r.headers.get("Location", ""), url, name)
 
     @staticmethod
     def _case_variants(name, cap=64):
-        """Every capitalisation of `name` (letters only), capped so long names stay cheap."""
         pos = [i for i, ch in enumerate(name) if ch.isalpha()]
         out = []
         if len(pos) <= 6:
@@ -889,9 +829,6 @@ class Engine:
         return res[:cap]
 
     async def _confirm(self, session, name, ms, log_q):
-        """Runs AFTER the snipe has already fired, as a background task, so it never
-        slows the sweep or the claim. A bounce is only real if (a) a known-taken canary
-        still resolves (not throttled) and (b) no other capitalisation of the name exists."""
         try:
             seed = self.cfg.get("canary")
             pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
@@ -911,7 +848,7 @@ class Engine:
                 if r == "TAKEN":
                     self._suppress[name] = time.perf_counter() + 300; self._false_pos += 1
                     log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn"))
-                    if self._case_seen.get(name) != v:      # tell Discord once per change
+                    if self._case_seen.get(name) != v:
                         self._case_seen[name] = v; self._notify_case(name, v)
                     return
             if again != "AVAILABLE":
@@ -929,15 +866,13 @@ class Engine:
             ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
             if status == "TAKEN":
                 if name not in self._canaries: self._canaries.append(name)
-                self._cache.discard(name)   # re-arm: alert again if it frees later
+                self._cache.discard(name)
                 log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
             elif status == "AVAILABLE":
                 if name in self._cache: return
                 if self._suppress.get(name, 0) > time.perf_counter(): return
                 self._cache.add(name)
-                # Snipe FIRST, unverified: a false positive costs a failed claim, a
-                # verification round trip in front of it costs the name. Skip only while
-                # we already know we're throttled (every bounce is junk then).
+
                 if time.perf_counter() >= self._throttled_until:
                     self._fire(name)
                 asyncio.create_task(self._confirm(session, name, ms, log_q))
@@ -955,7 +890,6 @@ class Engine:
             log_q.append((f"ERROR      {name}  {e}", "err"))
 
     def _fire(self, name):
-        """Hand the claim to a worker thread so the event loop never blocks on it."""
         if self.cfg.get("snipe_mode", False):
             self._snipe_ex.submit(self.on_snipe, name)
 
@@ -983,9 +917,6 @@ class Engine:
                 except: pass
             threading.Thread(target=_send_hook, daemon=True).start()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOGGLE
-# ═══════════════════════════════════════════════════════════════════════════════
 class Toggle(tk.Canvas):
     TW, TH, KR = 44, 22, 8
     def __init__(self, parent, var, color=None, bg=None, **kw):
@@ -1024,9 +955,6 @@ class Toggle(tk.Canvas):
         if col: self._col = col
         self._draw()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UI HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 def _fr(p, **kw):
     if "bg" not in kw: kw["bg"] = C["bg"]
     if "highlightthickness" not in kw: kw["highlightthickness"] = 0
@@ -1064,7 +992,7 @@ def _btn(p, text, cmd, fg=None, bg=None, font=FONT_S, **kw):
 
 def _abtn(p, text, cmd, col=None, bg=None, font=FONT_BOLD, **kw):
     c = col or C["accent"]
-    # Use a darker/lighter variant of the color as background for contrast
+
     bg_ = bg or C["panel"]
     b = tk.Button(p, text=text.upper(), command=cmd, bg=bg_, fg=c,
                   activebackground=C["border_hi"], activeforeground="#ffffff",
@@ -1092,9 +1020,6 @@ def _toggle_row(p, label, var, color):
     row.bind("<Button-1>", lambda _: var.set(not var.get()))
     return tog
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# THEME DIALOG
-# ═══════════════════════════════════════════════════════════════════════════════
 class ThemeDialog(tk.Toplevel):
     def __init__(self, master, on_apply):
         super().__init__(master)
@@ -1166,9 +1091,6 @@ class ThemeDialog(tk.Toplevel):
     def _apply_custom(self):
         self._on_apply(self._hue.get(), self._sat.get(), self._op.get(), "Custom"); self.destroy()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN APP
-# ═══════════════════════════════════════════════════════════════════════════════
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1187,8 +1109,7 @@ class App(tk.Tk):
         self._refresh_lists(); self._load_cfg(); self._refresh_creds_list()
         self._flush_log()
         self.after(500, self._reveal)
-        # Start pool immediately at launch so tokens are warm before checker starts.
-        # Runs in a background thread so the UI isn't blocked during initial token fetch.
+
         self.after(800, lambda: threading.Thread(
             target=lambda: SNIPER_POOL.start(on_log=self._push_log),
             daemon=True, name="sniper-pool-init").start())
@@ -1220,7 +1141,7 @@ class App(tk.Tk):
         s.map("Treeview.Heading", background=[("active", C["border_hi"])])
 
     def _build(self):
-        # -- Header (simple, no clutter) --
+
         h = _fr(self, bg=C["bg"]); h.pack(fill="x", padx=8, pady=(4, 0))
 
         _lbl(h, "META HORIZON", font=FONT_H1, fg=C["accent"], bg=C["bg"]).pack(side="left")
@@ -1235,15 +1156,11 @@ class App(tk.Tk):
 
         _sep(self, h=BD).pack(fill="x")
 
-        # -- Body --
         body = _fr(self, bg=C["bg"]); body.pack(fill="both", expand=True, padx=6, pady=(2, 0))
 
-
-        # Sidebar
         SB_W = 420
         sb = tk.Frame(body, bg=C["bg"], bd=0, width=SB_W)
         sb.pack(side="left", fill="y"); sb.pack_propagate(False)
-
 
         lc = tk.Canvas(sb, bg=C["bg"], highlightthickness=0, bd=0)
         scr = ttk.Scrollbar(sb, orient="vertical", command=lc.yview)
@@ -1255,7 +1172,6 @@ class App(tk.Tk):
         lc.create_window((0, 0), window=left, anchor="nw", width=SB_W - 18)
         left.bind("<Configure>", lambda e: lc.configure(scrollregion=lc.bbox("all")))
 
-        # Quick Check
         qcs = _section(left, "QUICK CHECK")
         qc_row = _fr(qcs, bg=C["panel"]); qc_row.pack(fill="x")
         self._quick_check_var = tk.StringVar()
@@ -1264,7 +1180,6 @@ class App(tk.Tk):
         qc_entry.bind("<Return>", lambda _: self._quick_check())
         _abtn(qc_row, "CHECK", self._quick_check, col=C["green"], bg=C["panel"], font=FONT_S).pack(side="right")
 
-        # List
         ls = _section(left, "LIST")
         self._list_var = tk.StringVar()
         self._list_cb = ttk.Combobox(ls, textvariable=self._list_var, state="readonly", font=FONT_BASE)
@@ -1276,7 +1191,6 @@ class App(tk.Tk):
         _btn(btn_row, "Refresh", self._refresh_lists).pack(side="right")
         _btn(btn_row, "Dedup", self._dedup_list, fg=C["yellow"]).pack(side="right", padx=2)
 
-        # Accounts
         acs = _section(left, "ACCOUNTS")
         add_row = _fr(acs, bg=C["panel"]); add_row.pack(fill="x")
         _abtn(add_row, "+ ADD ACCOUNT", self._open_add_account, col=C["green"], bg=C["panel"],
@@ -1304,7 +1218,6 @@ class App(tk.Tk):
         self._creds_info = tk.StringVar(value="0 accounts")
         _lbl(acs, "", font=FONT_XS, fg=C["dim"], bg=C["panel"], textvariable=self._creds_info).pack(anchor="w", pady=(1, 0))
 
-        # Settings
         ss = _section(left, "SETTINGS")
         self._v_loop  = tk.BooleanVar(value=True)
         self._v_snipe = tk.BooleanVar(value=False)
@@ -1340,7 +1253,6 @@ class App(tk.Tk):
             ttk.Spinbox(nr, from_=lo, to=hi, textvariable=v, width=7).grid(row=r2*2+1, column=c2, sticky="w", padx=(0, 8))
         nr.columnconfigure(0, weight=1); nr.columnconfigure(2, weight=1)
 
-        # Webhook
         ws = _section(left, "WEBHOOK")
         self._v_hook = tk.BooleanVar(value=False)
         _toggle_row(ws, "Enable", self._v_hook, C["accent2"])
@@ -1349,7 +1261,6 @@ class App(tk.Tk):
         self._hook_tmpl = _textw(ws, height=2); self._hook_tmpl.pack(fill="x")
         _btn(ws, "Test", self._test_webhook, fg=C["accent2"]).pack(anchor="e", pady=(1, 0))
 
-        # Controls
         ctrl = _fr(left, bg=C["bg"]); ctrl.pack(fill="x", pady=3)
         self._btn_start = _abtn(ctrl, "START", self._start, col=C["green"], bg=C["panel"])
         self._btn_start.pack(side="left", fill="x", expand=True, padx=(0, 2))
@@ -1362,7 +1273,6 @@ class App(tk.Tk):
         self._btn_stop.configure(state="disabled", fg=C["dim"])
         self._btn_stop.pack(side="left", fill="x", expand=True)
 
-        # Swap Fire — hammers the claim without waiting for checker detection
         sf = _section(left, "⚡ SWAP FIRE")
         _lbl(sf, "Target name to claim:", font=FONT_XS, fg=C["dim"], bg=C["panel"]).pack(anchor="w")
         self._swap_name = _entry(sf); self._swap_name.pack(fill="x", pady=(1, 4))
@@ -1378,15 +1288,12 @@ class App(tk.Tk):
         self._btn_swap = _abtn(sf, "⚡ FIRE NOW", self._do_swap_fire, col=C["yellow"], bg=C["panel"])
         self._btn_swap.pack(fill="x", pady=(4, 0))
 
-        # Save config below the control buttons
         save_ctrl = _fr(left, bg=C["bg"]); save_ctrl.pack(fill="x", pady=(4, 0))
         _abtn(save_ctrl, "SAVE CONFIG", self._save_cfg, col=C["text"], bg=C["border"]).pack(fill="x")
 
-        # Separator + Right panel
         tk.Frame(body, bg=C["dim2"], width=BD, bd=0).pack(side="left", fill="y", pady=4)
         right = _fr(body, bg=C["bg"]); right.pack(side="left", fill="both", expand=True, padx=(4, 0))
 
-        # Log
         lh = _fr(right, bg=C["bg"]); lh.pack(fill="x")
         _lbl(lh, "LOG", font=("Consolas", 9, "bold"), fg=C["dim"], bg=C["bg"]).pack(side="left")
         _btn(lh, "Clear", self._clear_log, bg=C["bg"]).pack(side="right")
@@ -1403,7 +1310,6 @@ class App(tk.Tk):
         self._log.tag_config("info",      foreground=C["dim"])
         self._log.tag_config("snipe",     foreground=C["accent2"])
 
-        # Found
         fh = _fr(right, bg=C["bg"]); fh.pack(fill="x")
         _lbl(fh, "FOUND", font=("Consolas", 9, "bold"), fg=C["green"], bg=C["bg"]).pack(side="left")
         self._found_cnt = tk.StringVar(value="0")
@@ -1417,7 +1323,6 @@ class App(tk.Tk):
         self._found_box.pack(fill="x", pady=(2, 0))
         self._found_box.bind("<Double-1>", self._found_double_click)
 
-        # -- Stats bar (bottom, spreads full width) --
         stat_bar = _fr(self, bg=C["bg"]); stat_bar.pack(fill="x", side="bottom", padx=6, pady=(2, 3))
         cards = _fr(stat_bar, bg=C["bg"]); cards.pack(fill="x", expand=True)
         self._sc_cycle  = self._stat(cards, "CYCLE", C["dim"])
@@ -1448,7 +1353,6 @@ class App(tk.Tk):
             else: messagebox.showwarning("Failed", f"{r.status_code}: {r.text[:200]}")
         except Exception as e: messagebox.showerror("Error", str(e))
 
-    # ── List ──────────────────────────────────────────────────────────────────
     def _refresh_lists(self):
         lists_ensure(); files = lists_all()
         self._list_cb["values"] = files
@@ -1480,7 +1384,6 @@ class App(tk.Tk):
             self._push_log(f"dedup: removed {removed}, kept {len(dd)}", "info")
         except Exception as e: self._push_log(f"dedup failed: {e}", "err")
 
-    # ── Accounts ──────────────────────────────────────────────────────────────
     def _refresh_creds_list(self):
         self._creds_tree.delete(*self._creds_tree.get_children())
         creds = creds_load(); ready = 0
@@ -1621,7 +1524,7 @@ class App(tk.Tk):
                 self._push_log("no accounts configured", "err")
                 return
             
-            # Find first usable account
+
             sniper = None
             for c in creds:
                 if not c.get('rate_limited') and not c.get('locked'):
@@ -1630,7 +1533,7 @@ class App(tk.Tk):
             if not sniper:
                 sniper = MetaUsernameSniper(creds[0])
             
-            # Use the check_token_valid method but with the actual username
+
             if not sniper.refresh_tokens():
                 self._push_log("failed to refresh tokens", "err")
                 return
@@ -1702,7 +1605,6 @@ class App(tk.Tk):
             self._refresh_creds_list()
         threading.Thread(target=_run, daemon=True).start()
 
-    # ── Config ────────────────────────────────────────────────────────────────
     def _apply_lf(self): self._log_filter = self._v_lf.get()
 
     def _load_cfg(self):
@@ -1734,7 +1636,6 @@ class App(tk.Tk):
     def _save_cfg(self):
         cfg_save(self._collect_cfg()); self._push_log("config saved", "info")
 
-    # ── Swap Fire ─────────────────────────────────────────────────────────────
     def _do_swap_fire(self):
         name = self._swap_name.get().strip()
         if not name:
@@ -1743,7 +1644,7 @@ class App(tk.Tk):
             self._push_log("swap: requests library not installed", "err"); return
         dur = float(self._swap_dur.get())
         interval = max(0.05, float(self._swap_interval.get()) / 1000.0)
-        # Arm the pool if it hasn't been started yet (checker might not be running)
+
         if not SNIPER_POOL._pool:
             SNIPER_POOL.start(on_log=self._push_log)
         self._btn_swap.configure(state="disabled", fg=C["dim"], cursor="arrow")
@@ -1756,19 +1657,16 @@ class App(tk.Tk):
                               on_log=self._push_log)
         self.after(int(dur * 1000) + 1500, self._refresh_creds_list)
 
-    # ── Snipe ─────────────────────────────────────────────────────────────────
     def _do_snipe(self, name=""):
         if not name:
             self._push_log("snipe: no name provided", "err"); return
         if not _requests:
             self._push_log("snipe: requests not installed", "err"); return
-        # fire() is non-blocking — submits to the live thread pool and returns instantly.
-        # No disk reads, no thread creation overhead in the hot path.
+
         SNIPER_POOL.fire(name, on_log=self._push_log)
-        # Refresh UI after a short delay to reflect any lock changes
+
         self.after(1500, self._refresh_creds_list)
 
-    # ── Start / Pause / Stop ──────────────────────────────────────────────────
     def _start(self):
         if self.engine and self.engine.running:
             if self.engine.paused: self._resume_engine()
@@ -1817,7 +1715,6 @@ class App(tk.Tk):
             self._btn_pause.configure(state="disabled", fg=C["dim"], cursor="arrow", text="PAUSE")
             self._btn_stop.configure(state="disabled", fg=C["dim"], cursor="arrow")
 
-    # ── Log ───────────────────────────────────────────────────────────────────
     def _should_log(self, tag):
         f = self._log_filter
         if f == "all": return True
@@ -1892,9 +1789,7 @@ class App(tk.Tk):
         self._found_box.configure(state="normal"); self._found_box.delete("1.0", "end")
         self._found_box.configure(state="disabled")
 
-    # ── Theme ─────────────────────────────────────────────────────────────────
     def _rebuild_ui(self):
-        """Destroy all children and rebuild the entire UI with current palette."""
         for child in self.winfo_children():
             child.destroy()
         self._style()
