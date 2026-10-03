@@ -181,7 +181,7 @@ RATE_LIMIT_COOLDOWN = 90
 
 class SniperPool:
     REFRESH_INTERVAL = 210
-    RETRY_INTERVAL   = 30
+    RETRY_INTERVAL   = 15
 
     def __init__(self):
         self._snipers: list[tuple[int, dict, 'MetaUsernameSniper']] = []
@@ -260,6 +260,13 @@ class SniperPool:
         ok_n = len(entries) - len(failed)
         self._log(f"sniper ready — {ok_n}/{len(entries)} accounts with fresh tokens", "info")
 
+    def _keep_warm(self):
+        with self._lock:
+            entries = list(self._snipers)
+        for _i, _c, sniper in entries:
+            try: sniper.session.head(API_URL, timeout=3)
+            except Exception: pass
+
     def _retry_failed_tokens(self):
         with self._lock:
             to_retry = list(self._failed_warm)
@@ -292,7 +299,9 @@ class SniperPool:
     def _refresh_loop(self):
         next_full = time.time() + self.REFRESH_INTERVAL
         while not self._refresh_stop.wait(self.RETRY_INTERVAL):
+            self._keep_warm()
             if time.time() >= next_full:
+                TOKEN_CACHE.clear()
                 self._rebuild()
                 next_full = time.time() + self.REFRESH_INTERVAL
             else:
@@ -477,6 +486,8 @@ class SniperPool:
 
         threading.Thread(target=_run, daemon=True).start()
 
+DETECT_T: dict = {}
+CLAIM_LAT: list = []
 SNIPER_POOL = SniperPool()
 
 _SNIPE_SESSIONS: dict = {}
@@ -574,6 +585,8 @@ class MetaUsernameSniper:
         last_err = 'unknown'
         for attempt in range(max(1, retries)):
             try:
+                if attempt == 0 and username in DETECT_T:
+                    CLAIM_LAT.append((time.perf_counter() - DETECT_T[username]) * 1000)
                 r = self.session.post(API_URL, headers=self._cached_headers,
                                       data=_build_data(), timeout=5)
                 result = r.json()
@@ -700,6 +713,7 @@ class Engine:
         self._names, self._list_path, self.on_rename = [], "", None
         self._rename_lock = threading.Lock()
         self._timeouts = 0
+        self._lat = collections.deque(maxlen=5000)
         self._limit, self._to_frac = 0, 0.0
         self._case_seen = {}
         self._throttle_events = self._false_pos = 0
@@ -795,6 +809,9 @@ class Engine:
                     self._limit = min(conc, self._limit + 1)
 
         self._names, self._list_path = names, path
+        pr = os.environ.get("PROXIES") or cfg.get("proxies") or ""
+        proxies = [p.strip() for p in (pr if isinstance(pr, list) else pr.split(",")) if p and p.strip()]
+        if proxies: self.on_log(f"{len(proxies)} proxies, workers pinned round-robin", "info")
         idx = [0]
         n_names = len(names)
 
@@ -808,7 +825,8 @@ class Engine:
                 if wait > 0: await asyncio.sleep(min(wait, 0.5)); continue
                 i = idx[0]; idx[0] += 1
                 if not loop_mode and i >= n_names: break
-                await self._check(session, names[i % n_names], _log_q)
+                await self._check(session, names[i % n_names], _log_q,
+                                  proxies[k % len(proxies)] if proxies else None)
                 self._total_checks += 1
 
         try:
@@ -831,9 +849,9 @@ class Engine:
             except: pass
         self.running = False; self.on_status("stopped"); self.on_log("stopped", "info")
 
-    async def _head(self, session, name):
+    async def _head(self, session, name, proxy=None):
         url = f"https://horizon.meta.com/profile/{name}/"
-        async with session.head(url, allow_redirects=False) as r:
+        async with session.head(url, allow_redirects=False, proxy=proxy) as r:
             return parse_status(r.status, r.headers.get("Location", ""), url, name)
 
     @staticmethod
@@ -889,11 +907,12 @@ class Engine:
         except Exception as e:
             log_q.append((f"ERROR      confirm {name} {e}", "err"))
 
-    async def _check(self, session, name, log_q: collections.deque):
+    async def _check(self, session, name, log_q: collections.deque, proxy=None):
         t = time.perf_counter()
         try:
-            status = await self._head(session, name)
+            status = await (self._head(session, name, proxy) if proxy else self._head(session, name))
             self._win_ok += 1
+            self._lat.append(time.perf_counter() - t)
             ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
             if status == "TAKEN":
                 if name not in self._canaries: self._canaries.append(name)
@@ -923,6 +942,7 @@ class Engine:
             log_q.append((f"ERROR      {name}  {e}", "err"))
 
     def _fire(self, name):
+        DETECT_T[name] = time.perf_counter()
         if self.cfg.get("snipe_mode", False):
             self._snipe_ex.submit(self.on_snipe, name)
 
