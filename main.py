@@ -207,12 +207,14 @@ class SniperPool:
         self._lock = threading.Lock()
         self._on_log = None
         self._failed_warm: list = []
+        self._cfg: dict = {}
         # In-memory mirror of per-account status — eliminates disk read on hot path.
         # Keyed by account index; updated atomically by _set_state().
         self._state: dict[int, dict] = {}
 
     def start(self, on_log=None):
         self._on_log = on_log
+        self._cfg = cfg_load()
         self._rebuild()
         # Start background refresher
         self._refresh_stop.clear()
@@ -272,7 +274,7 @@ class SniperPool:
             if self._pool:
                 try: self._pool.shutdown(wait=False, cancel_futures=True)
                 except: self._pool.shutdown(wait=False)
-            n = max(len(entries), 1)
+            n = max(len(entries), 1) * max(1, int(self._cfg.get('snipe_burst', 3))) * 4
             self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=n, thread_name_prefix="snipe")
 
         ok_n = len(entries) - len(failed)
@@ -376,19 +378,24 @@ class SniperPool:
         if not snipers:
             log("snipe: no available accounts (all locked/rate-limited/used)", "warn"); return
 
-        log(f"FIRING {len(snipers)} accounts simultaneously for '{name}'", "snipe")
+        burst  = max(1, int(self._cfg.get("snipe_burst", 3)))      # parallel shots per account per round
+        rounds = max(1, int(self._cfg.get("snipe_rounds", 12)))    # rounds before giving up
+        gap    = float(self._cfg.get("snipe_interval", 0.05))      # seconds between rounds
+        log(f"FIRING {len(snipers)} accounts x{burst} every {int(gap*1000)}ms for '{name}'", "snipe")
 
-        winner = [None]
+        won = threading.Event()
         winner_lock = threading.Lock()
+        logged = set()
 
         def _attempt(entry):
             idx, c, sniper = entry
+            if won.is_set(): return
             uname = c.get('username') or c['PROFILE_ID'][:8]
-            result = sniper.change(name)
+            result = sniper.change(name, retries=1, retry_delay=0)
             if result.get('success'):
                 with winner_lock:
-                    if winner[0] is None:
-                        winner[0] = idx
+                    if not won.is_set():
+                        won.set()
                         self._set_state(idx, 'sniped', name)
                         self._set_state(idx, 'username', name)
                         self._set_state(idx, 'locked', True)
@@ -401,13 +408,24 @@ class SniperPool:
                         threading.Thread(target=_confirm, daemon=True).start()
             else:
                 err = result.get('error', 'unknown')
-                log(f"account {idx+1} ({uname}): {err}", "err")
+                if idx not in logged:            # one line per account, not one per shot
+                    logged.add(idx); log(f"account {idx+1} ({uname}): {err}", "err")
                 if any(kw in str(err).lower() for kw in ('rate', 'spam', 'limit', 'block')):
                     self._set_state(idx, 'rate_limited', True)
                     self._set_state(idx, 'rate_limited_since', time.time())
 
-        futures = [pool.submit(_attempt, entry) for entry in snipers]
-        threading.Thread(target=lambda: concurrent.futures.wait(futures), daemon=True).start()
+        def _hammer():
+            # Round 0 goes out immediately; only later rounds wait.
+            for rnd in range(rounds):
+                if won.is_set(): break
+                for entry in snipers:
+                    if self._get_state(entry[0]).get('rate_limited'): continue
+                    for _ in range(burst): pool.submit(_attempt, entry)
+                if rnd < rounds - 1: time.sleep(gap)
+            if not won.is_set():
+                log(f"snipe: '{name}' not claimed after {rounds} rounds", "warn")
+
+        threading.Thread(target=_hammer, daemon=True).start()
 
     def swap_fire(self, name, interval=0.1, duration=5.0, on_log=None):
         """
@@ -576,7 +594,7 @@ class MetaUsernameSniper:
             'server_timestamps': 'true',
         }
 
-    def change(self, username, retries=3, retry_delay=0.15):
+    def change(self, username, retries=3, retry_delay=0.05):
         """
         Claim `username`. Retries up to `retries` times — critical for swap windows
         where Meta's servers haven't fully committed the change yet.
@@ -730,6 +748,10 @@ class Engine:
         self.running, self.paused = False, False
         self._cache, self._found, self._cycle = set(), 0, 0
         self._total_checks = 0
+        self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
+        self._suppress = {}
+        self._throttle_events = self._false_pos = 0
+        self._snipe_ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="fire")
 
     def start(self):
         if self.running: return
@@ -737,7 +759,12 @@ class Engine:
         self._cache.clear(); self._found = 0; self._cycle = 0
         self._total_checks = 0
         SNIPER_POOL.start(on_log=self.on_log)  # pre-warm all snipe sessions & tokens
-        threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True).start()
+        def _go():
+            try:
+                import uvloop; uvloop.install()
+            except Exception: pass
+            asyncio.run(self._run())
+        threading.Thread(target=_go, daemon=True).start()
 
     def pause(self): self.paused = True
     def resume(self): self.paused = False
@@ -754,41 +781,30 @@ class Engine:
         if not names:
             self.on_log("list is empty", "err"); self.running = False; return
 
-        tc = float(cfg.get("timeout_total",   0.5))
-        cc = float(cfg.get("timeout_connect", 0.1))
+        # Sane timeouts: 0 / huge values in old configs mean "hang forever", which
+        # pins a worker slot on a dead socket.
+        tc = float(cfg.get("timeout_total", 0) or 0)
+        cc = float(cfg.get("timeout_connect", 0) or 0)
+        tc = tc if 0 < tc <= 10 else 3.0
+        cc = cc if 0 < cc <= 10 else 2.0
+        # Global in-flight cap. Burst tests stayed clean at 64 (~230 names/s); the
+        # old 5-per-name fan-out was 5x the requests for no faster detection.
+        conc = int(cfg.get("concurrency", 0) or 0)
+        conc = conc if 0 < conc <= 512 else 64
         loop_mode = cfg.get("loop_mode", True)
-        CONCUR = 5  # simultaneous requests per name
-        self.on_log(f"{len(names)} names — FULL SEND (×{CONCUR}/name, {tc}s timeout)", "info")
-
-        # Pre-resolve DNS once — all requests skip lookup
-        import socket
-        try:
-            _ip = socket.gethostbyname("horizon.meta.com")
-            self.on_log(f"DNS resolved: {_ip}", "info")
-        except: _ip = None
+        self.on_log(f"{len(names)} names — HEAD x{conc} in flight, {tc}s timeout", "info")
 
         _timeout = aiohttp.ClientTimeout(total=tc, connect=cc)
-        _hdrs = {"User-Agent": "Mozilla/5.0", "Connection": "keep-alive",
-                 "Accept-Encoding": "identity"}
-
-        # Single shared connector + session — one pool, optimal connection reuse.
+        _hdrs = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US",
+                 "Connection": "keep-alive", "Accept-Encoding": "identity"}
         conn = aiohttp.TCPConnector(
-            limit=0, limit_per_host=0,
+            limit=conc + 80, limit_per_host=conc + 80,
             use_dns_cache=True, ttl_dns_cache=600,
-            keepalive_timeout=60,
-            enable_cleanup_closed=True,
-            force_close=False,
-            ssl=False,
+            keepalive_timeout=120, enable_cleanup_closed=True, ssl=False,
         )
-        if _ip:
-            try: conn._resolver._cache[("horizon.meta.com", 0, 0)] = (
-                0, [{"hostname": "horizon.meta.com", "host": _ip, "port": 443,
-                     "family": 2, "proto": 0, "flags": 0}])
-            except: pass
         session = aiohttp.ClientSession(connector=conn, headers=_hdrs,
                                         timeout=_timeout, connector_owner=True)
 
-        # Log queue — AVAILABLE fires immediately; noisy logs batched every 50ms
         _log_q: collections.deque = collections.deque()
 
         async def _log_drain():
@@ -798,7 +814,6 @@ class Engine:
                     msg, tag = _log_q.popleft()
                     self.on_log(msg, tag)
 
-        # Stats coroutine — every 250ms, not on every single check
         t_start = time.perf_counter()
 
         async def _stats_loop():
@@ -809,29 +824,34 @@ class Engine:
                 self._cycle = self._total_checks // max(len(names), 1)
                 self.on_stats(self._cycle, self._found, 0, cps, self._total_checks)
 
-        # Per-name worker: keeps CONCUR requests in-flight simultaneously.
-        # Semaphore acquired before task creation, released inside _check.
-        async def _worker(name):
-            sem = asyncio.Semaphore(CONCUR)
+        # One shared cursor; every worker pulls the next name, so each name is
+        # hit as often as the pipe allows with no per-request task/semaphore churn.
+        idx = [0]
+        n_names = len(names)
+
+        async def _worker():
             while self.running:
                 while self.paused and self.running: await asyncio.sleep(0.02)
                 if not self.running: break
-                await sem.acquire()
-                if not self.running: sem.release(); break
-                asyncio.create_task(self._check(session, name, sem, _log_q))
+                wait = self._throttled_until - time.perf_counter()
+                if wait > 0: await asyncio.sleep(min(wait, 0.5)); continue
+                i = idx[0]; idx[0] += 1
+                if not loop_mode and i >= n_names: break
+                await self._check(session, names[i % n_names], _log_q)
                 self._total_checks += 1
-                if not loop_mode:
-                    for _ in range(CONCUR): await sem.acquire()  # drain in-flight
-                    break
 
         try:
             self.on_status("running")
-            worker_tasks = [asyncio.create_task(_worker(n)) for n in names]
+            self._throttled_until = 0.0; self._backoff = 0.5
             bg_tasks = [asyncio.create_task(_log_drain()),
                         asyncio.create_task(_stats_loop())]
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            # Warm every pooled connection first (cold TLS handshake is ~500ms).
+            await asyncio.gather(*[self._head(session, names[0]) for _ in range(conc)],
+                                 return_exceptions=True)
+            workers = [asyncio.create_task(_worker()) for _ in range(conc)]
+            await asyncio.gather(*workers, return_exceptions=True)
+            self.running = False
             for t in bg_tasks: t.cancel()
-            # Final drain
             while _log_q:
                 msg, tag = _log_q.popleft(); self.on_log(msg, tag)
         finally:
@@ -839,38 +859,104 @@ class Engine:
             except: pass
         self.running = False; self.on_status("stopped"); self.on_log("stopped", "info")
 
-    async def _check(self, session, name, sem: asyncio.Semaphore, log_q: collections.deque):
+    async def _head(self, session, name):
+        """One existence probe. HEAD + no redirect-follow: ~100ms, 0KB body."""
         url = f"https://horizon.meta.com/profile/{name}/"
+        async with session.head(url, allow_redirects=False) as r:
+            return parse_status(r.status, r.headers.get("Location", ""), url, name)
+
+    @staticmethod
+    def _case_variants(name, cap=64):
+        """Every capitalisation of `name` (letters only), capped so long names stay cheap."""
+        pos = [i for i, ch in enumerate(name) if ch.isalpha()]
+        out = []
+        if len(pos) <= 6:
+            for m in range(1 << len(pos)):
+                chars = list(name.lower())
+                for k, i in enumerate(pos):
+                    if m >> k & 1: chars[i] = chars[i].upper()
+                out.append("".join(chars))
+        else:
+            low = name.lower()
+            out = [low, low.upper(), low.capitalize()]
+            for i in pos:
+                out.append(low[:i] + low[i].upper() + low[i+1:])
+                out.append(low.upper()[:i] + low[i] + low.upper()[i+1:])
+        seen, res = set(), []
+        for v in out:
+            if v != name and v not in seen: seen.add(v); res.append(v)
+        return res[:cap]
+
+    async def _confirm(self, session, name, ms, log_q):
+        """Runs AFTER the snipe has already fired, as a background task, so it never
+        slows the sweep or the claim. A bounce is only real if (a) a known-taken canary
+        still resolves (not throttled) and (b) no other capitalisation of the name exists."""
+        try:
+            seed = self.cfg.get("canary")
+            pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
+            probes = [self._head(session, name)]
+            probes.append(self._head(session, pool[-1]) if pool else asyncio.sleep(0, "NOCANARY"))
+            variants = self._case_variants(name)
+            probes += [self._head(session, v) for v in variants]
+            res = await asyncio.gather(*probes, return_exceptions=True)
+            again, canary, var_res = res[0], res[1], res[2:]
+            if canary == "NOCANARY" or canary != "TAKEN":
+                self._throttled_until = time.perf_counter() + self._backoff
+                self._backoff = min(self._backoff * 2, 10.0)
+                self._cache.discard(name); self._throttle_events += 1
+                log_q.append((f"THROTTLED  {name:<22} bounce unconfirmed", "warn")); return
+            self._backoff = 0.5
+            for v, r in zip(variants, var_res):
+                if r == "TAKEN":
+                    self._suppress[name] = time.perf_counter() + 300; self._false_pos += 1
+                    log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn")); return
+            if again != "AVAILABLE":
+                self._cache.discard(name); return
+            self._found += 1
+            self._notify(name)
+            self.on_log(f"AVAILABLE  {name:<22} {ms} (confirmed)", "available")
+        except Exception as e:
+            log_q.append((f"ERROR      confirm {name} {e}", "err"))
+
+    async def _check(self, session, name, log_q: collections.deque):
         t = time.perf_counter()
         try:
-            async with session.get(url, allow_redirects=False) as r:
-                el = time.perf_counter() - t
-                status = parse_status(r.status, r.headers.get("Location", ""), str(r.url), name)
-                ms = f"{el*1000:.0f}ms"
-                if status == "AVAILABLE":
-                    # Fire snipe FIRST — every microsecond matters in a swap window.
-                    # Log after so the callback chain doesn't add latency before submit.
-                    if name not in self._cache:
-                        self._cache.add(name); self._found += 1; self._alert(name)
-                    self.on_log(f"AVAILABLE  {name:<22} {ms}", "available")
-                elif status == "RATE":
-                    log_q.append((f"RATE       {name:<22}", "warn"))
-                elif status == "TAKEN":
-                    log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
-                else:
-                    log_q.append((f"UNKNOWN    {name:<22} {ms}", "unknown"))
+            status = await self._head(session, name)
+            ms = f"{(time.perf_counter() - t)*1000:.0f}ms"
+            if status == "TAKEN":
+                if name not in self._canaries: self._canaries.append(name)
+                self._cache.discard(name)   # re-arm: alert again if it frees later
+                log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
+            elif status == "AVAILABLE":
+                if name in self._cache: return
+                if self._suppress.get(name, 0) > time.perf_counter(): return
+                self._cache.add(name)
+                # Snipe FIRST, unverified: a false positive costs a failed claim, a
+                # verification round trip in front of it costs the name. Skip only while
+                # we already know we're throttled (every bounce is junk then).
+                if time.perf_counter() >= self._throttled_until:
+                    self._fire(name)
+                asyncio.create_task(self._confirm(session, name, ms, log_q))
+            elif status == "RATE":
+                self._throttled_until = time.perf_counter() + self._backoff
+                self._backoff = min(self._backoff * 2, 10.0)
+                log_q.append((f"RATE       {name:<22}", "warn"))
+            else:
+                log_q.append((f"UNKNOWN    {name:<22} {ms}", "unknown"))
         except asyncio.TimeoutError:
             log_q.append((f"TIMEOUT    {name:<22}", "timeout"))
         except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError):
             log_q.append((f"CONN ERR   {name:<22}", "timeout"))
         except Exception as e:
             log_q.append((f"ERROR      {name}  {e}", "err"))
-        finally:
-            sem.release()  # always release so the worker can fire the next request
 
-    def _alert(self, name):
+    def _fire(self, name):
+        """Hand the claim to a worker thread so the event loop never blocks on it."""
+        if self.cfg.get("snipe_mode", False):
+            self._snipe_ex.submit(self.on_snipe, name)
+
+    def _notify(self, name):
         cfg = self.cfg
-        if cfg.get("snipe_mode", False): self.on_snipe(name)
         self.on_found(name)
         if pyperclip:
             try: pyperclip.copy(name)

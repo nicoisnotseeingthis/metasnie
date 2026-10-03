@@ -6,6 +6,7 @@ claiming and webhook logic runs without a GUI inside GitHub Actions.
 import os
 import sys
 import time
+import json
 import threading
 import types
 
@@ -111,6 +112,84 @@ def send_claimed(name, acct=""):
 
 
 # ---------------------------------------------------------------------------
+# Periodic report (every REPORT_HOURS, default 4): stats persist in state/stats.json (cached between Actions runs)
+# ---------------------------------------------------------------------------
+REPORT_EVERY = float(os.environ.get("REPORT_HOURS") or CFG.get("report_hours", 4)) * 3600
+STATS_FILE = os.path.join("state", "stats.json")
+os.makedirs("state", exist_ok=True)
+
+
+def _fresh_stats():
+    return {"since": time.time(), "checks": 0, "runtime": 0.0, "runs": 0,
+            "found": [], "claims": [], "attempts": 0, "throttled": 0, "false_pos": 0}
+
+
+try:
+    with open(STATS_FILE) as _f:
+        stats = {**_fresh_stats(), **json.load(_f)}
+except Exception:
+    stats = _fresh_stats()
+stats["runs"] += 1
+
+
+def save_stats():
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f)
+    except Exception:
+        pass
+
+
+def build_report():
+    hrs = max((time.time() - stats["since"]) / 3600, 0.01)
+    cps = stats["checks"] / stats["runtime"] if stats["runtime"] > 0 else 0
+    uniq = sorted(set(stats["found"]))
+    lines = [
+        f"**Update** — last {hrs:.1f}h",
+        f"Checks: **{stats['checks']:,}** (avg {cps:.0f}/s) across {len(NAMES)} names, {stats['runs']} run(s)",
+        f"Available (confirmed): **{len(uniq)}**" + (f" — {', '.join(f'`{n}`' for n in uniq[:20])}" if uniq else ""),
+        f"Claimed: **{len(stats['claims'])}**" + (f" — {', '.join(f'`{n}`' for n in stats['claims'])}" if stats["claims"] else ""),
+        f"Claim attempts: {stats['attempts']} | throttle events: {stats['throttled']} | false positives filtered: {stats['false_pos']}",
+    ]
+    return "\n".join(lines)
+
+
+def post_report():
+    msg = build_report()
+    log(msg.replace("\n", " | "), "report")
+    send_hook(msg)
+    stats.clear(); stats.update(_fresh_stats()); stats["runs"] = 1
+    save_stats()
+
+
+_seen = {"checks": 0, "t": time.time(), "thr": 0, "fp": 0}
+
+
+def flush_stats(final=False):
+    eng = globals().get("engine")
+    now = time.time()
+    if eng is not None:
+        stats["checks"] += max(eng._total_checks - _seen["checks"], 0)
+        stats["throttled"] += max(eng._throttle_events - _seen["thr"], 0)
+        stats["false_pos"] += max(eng._false_pos - _seen["fp"], 0)
+        _seen.update(checks=eng._total_checks, thr=eng._throttle_events, fp=eng._false_pos)
+    stats["runtime"] += now - _seen["t"]
+    _seen["t"] = now
+    save_stats()
+    if not final and (now - stats["since"] >= REPORT_EVERY or os.environ.get("REPORT_NOW")):
+        os.environ.pop("REPORT_NOW", None)
+        post_report()
+
+
+def _stats_thread():
+    while True:
+        time.sleep(60)
+        flush_stats()
+
+
+threading.Thread(target=_stats_thread, daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # Patch the sniper so a successful claim immediately sends the @everyone webhook
 # ---------------------------------------------------------------------------
 _orig_change = M.MetaUsernameSniper.change
@@ -118,7 +197,9 @@ _orig_change = M.MetaUsernameSniper.change
 
 def _patched_change(self, name, retries=3, retry_delay=0.15):
     res = _orig_change(self, name, retries, retry_delay)
+    stats["attempts"] += 1
     if res.get("success"):
+        stats["claims"].append(name)
         acct = self.cred.get("username") or self.profile_id[:8]
         send_claimed(name, acct)
     return res
@@ -145,6 +226,7 @@ def on_status(s):
 
 def on_found(name):
     log(f"FOUND {name}", "available")
+    stats["found"].append(name)
 
 
 def on_snipe(name):
@@ -166,6 +248,8 @@ M.refresh_account_usernames(on_log=log)
 
 engine = M.Engine(CFG, log, on_status, on_found, on_stats, on_snipe)
 engine.start()
+if time.time() - stats["since"] >= REPORT_EVERY:
+    flush_stats()
 
 try:
     if MAX_RUNTIME > 0:
@@ -181,3 +265,4 @@ except KeyboardInterrupt:
     engine.stop()
 finally:
     time.sleep(2)
+    flush_stats(final=True)
