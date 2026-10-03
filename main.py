@@ -576,7 +576,7 @@ class MetaUsernameSniper:
             'server_timestamps': 'true',
         }
 
-    def change(self, username, retries=3, retry_delay=0.15):
+    def change(self, username, retries=3, retry_delay=0.05):
         """
         Claim `username`. Retries up to `retries` times — critical for swap windows
         where Meta's servers haven't fully committed the change yet.
@@ -731,6 +731,8 @@ class Engine:
         self._cache, self._found, self._cycle = set(), 0, 0
         self._total_checks = 0
         self._canaries, self._throttled_until, self._backoff = collections.deque(maxlen=4), 0.0, 0.5
+        self._suppress = {}
+        self._snipe_ex = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="fire")
 
     def start(self):
         if self.running: return
@@ -777,7 +779,7 @@ class Engine:
         _hdrs = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US",
                  "Connection": "keep-alive", "Accept-Encoding": "identity"}
         conn = aiohttp.TCPConnector(
-            limit=conc, limit_per_host=conc,
+            limit=conc + 80, limit_per_host=conc + 80,
             use_dns_cache=True, ttl_dns_cache=600,
             keepalive_timeout=120, enable_cleanup_closed=True, ssl=False,
         )
@@ -844,23 +846,58 @@ class Engine:
         async with session.head(url, allow_redirects=False) as r:
             return parse_status(r.status, r.headers.get("Location", ""), url, name)
 
-    async def _verify(self, session, name):
-        """A bounce means 'no such profile' OR 'you are throttled'. Re-probe the name
-        and a known-existing canary in parallel (one round trip). Only a repeat bounce
-        with a canary that still resolves is a real AVAILABLE."""
-        seed = self.cfg.get("canary")
-        pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
-        if not pool: return False   # nothing known-good to compare against: can't confirm
-        res = await asyncio.gather(self._head(session, name), self._head(session, pool[-1]),
-                                   return_exceptions=True)
-        again = res[0]
-        if res[1] != "TAKEN":
-            # Canary stopped resolving -> we are being throttled; back off, discard.
-            self._throttled_until = time.perf_counter() + self._backoff
-            self._backoff = min(self._backoff * 2, 10.0)
-            return False
-        self._backoff = 0.5
-        return again == "AVAILABLE"
+    @staticmethod
+    def _case_variants(name, cap=64):
+        """Every capitalisation of `name` (letters only), capped so long names stay cheap."""
+        pos = [i for i, ch in enumerate(name) if ch.isalpha()]
+        out = []
+        if len(pos) <= 6:
+            for m in range(1 << len(pos)):
+                chars = list(name.lower())
+                for k, i in enumerate(pos):
+                    if m >> k & 1: chars[i] = chars[i].upper()
+                out.append("".join(chars))
+        else:
+            low = name.lower()
+            out = [low, low.upper(), low.capitalize()]
+            for i in pos:
+                out.append(low[:i] + low[i].upper() + low[i+1:])
+                out.append(low.upper()[:i] + low[i] + low.upper()[i+1:])
+        seen, res = set(), []
+        for v in out:
+            if v != name and v not in seen: seen.add(v); res.append(v)
+        return res[:cap]
+
+    async def _confirm(self, session, name, ms, log_q):
+        """Runs AFTER the snipe has already fired, as a background task, so it never
+        slows the sweep or the claim. A bounce is only real if (a) a known-taken canary
+        still resolves (not throttled) and (b) no other capitalisation of the name exists."""
+        try:
+            seed = self.cfg.get("canary")
+            pool = [c for c in list(self._canaries) + ([seed] if seed else []) if c != name]
+            probes = [self._head(session, name)]
+            probes.append(self._head(session, pool[-1]) if pool else asyncio.sleep(0, "NOCANARY"))
+            variants = self._case_variants(name)
+            probes += [self._head(session, v) for v in variants]
+            res = await asyncio.gather(*probes, return_exceptions=True)
+            again, canary, var_res = res[0], res[1], res[2:]
+            if canary == "NOCANARY" or canary != "TAKEN":
+                self._throttled_until = time.perf_counter() + self._backoff
+                self._backoff = min(self._backoff * 2, 10.0)
+                self._cache.discard(name)
+                log_q.append((f"THROTTLED  {name:<22} bounce unconfirmed", "warn")); return
+            self._backoff = 0.5
+            for v, r in zip(variants, var_res):
+                if r == "TAKEN":
+                    self._suppress[name] = time.perf_counter() + 300
+                    log_q.append((f"CASE TAKEN {name:<22} exists as '{v}'", "warn")); return
+            if again != "AVAILABLE":
+                self._cache.discard(name); return
+            self._found += 1
+            self._notify(name)
+            self.on_log(f"AVAILABLE  {name:<22} {ms} (confirmed)", "available")
+        except Exception as e:
+            log_q.append((f"ERROR      confirm {name} {e}", "err"))
 
     async def _check(self, session, name, log_q: collections.deque):
         t = time.perf_counter()
@@ -873,11 +910,14 @@ class Engine:
                 log_q.append((f"TAKEN      {name:<22} {ms}", "taken"))
             elif status == "AVAILABLE":
                 if name in self._cache: return
-                if not await self._verify(session, name):
-                    log_q.append((f"THROTTLED  {name:<22} bounce unconfirmed", "warn")); return
-                if name not in self._cache:
-                    self._cache.add(name); self._found += 1; self._alert(name)
-                self.on_log(f"AVAILABLE  {name:<22} {ms}", "available")
+                if self._suppress.get(name, 0) > time.perf_counter(): return
+                self._cache.add(name)
+                # Snipe FIRST, unverified: a false positive costs a failed claim, a
+                # verification round trip in front of it costs the name. Skip only while
+                # we already know we're throttled (every bounce is junk then).
+                if time.perf_counter() >= self._throttled_until:
+                    self._fire(name)
+                asyncio.create_task(self._confirm(session, name, ms, log_q))
             elif status == "RATE":
                 self._throttled_until = time.perf_counter() + self._backoff
                 self._backoff = min(self._backoff * 2, 10.0)
@@ -891,9 +931,13 @@ class Engine:
         except Exception as e:
             log_q.append((f"ERROR      {name}  {e}", "err"))
 
-    def _alert(self, name):
+    def _fire(self, name):
+        """Hand the claim to a worker thread so the event loop never blocks on it."""
+        if self.cfg.get("snipe_mode", False):
+            self._snipe_ex.submit(self.on_snipe, name)
+
+    def _notify(self, name):
         cfg = self.cfg
-        if cfg.get("snipe_mode", False): self.on_snipe(name)
         self.on_found(name)
         if pyperclip:
             try: pyperclip.copy(name)
