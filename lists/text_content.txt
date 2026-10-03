@@ -15,7 +15,7 @@ Bun
 bro
 but
 Bye
-calm
+Calm
 can
 car
 card
@@ -116,7 +116,7 @@ set
 sick
 sin
 slit
-SOAR
+soar
 son
 spy
 stab
@@ -128,7 +128,7 @@ too
 top
 tow
 toy
-Twerk
+twerk
 ugh
 uwu
 vape
@@ -147,5 +147,5 @@ yet
 you
 zip
 gone
-Hat
+hat
 Goth
