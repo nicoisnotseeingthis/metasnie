@@ -785,7 +785,7 @@ Rake
 Ramp
 rent
 Rice
-riot
+Riot
 Risk
 Robe
 Role
