@@ -909,7 +909,7 @@ drone
 Elbow
 Elder
 Emoji
-entry
+Entry
 Fable
 Fence
 Ferry
