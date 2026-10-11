@@ -1992,7 +1992,7 @@ dies
 Disc
 Does
 Done
-DOOM
+doom
 DOSE
 Drag
 Dual
