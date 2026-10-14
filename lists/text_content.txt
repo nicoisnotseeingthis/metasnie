@@ -26,7 +26,7 @@ cut
 dab
 daddy
 damn
-day
+Day
 DEFAULT
 dev
 die
