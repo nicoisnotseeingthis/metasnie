@@ -1187,7 +1187,7 @@ hug
 JAM
 jaw
 Job
-Leg
+leg
 lip
 Log
 Map
