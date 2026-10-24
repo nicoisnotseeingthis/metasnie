@@ -1641,7 +1641,7 @@ Trend
 trick
 TRUCK
 Trust
-uncle
+UNCLE
 union
 urban
 Value
