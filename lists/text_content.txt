@@ -982,7 +982,7 @@ Razor
 Relay
 Rhino
 Rider
-Rival
+rival
 Roast
 Rodeo
 Rover
