@@ -2091,7 +2091,7 @@ easter
 thanksgiving
 Valentine
 holiday
-birthday
+Birthday
 Winter
 Santa
 Snowman
