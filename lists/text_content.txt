@@ -109,7 +109,7 @@ rem
 sober
 rope
 Row
-SAD
+sad
 Sea
 see
 set
@@ -118,7 +118,7 @@ sin
 slit
 soar
 son
-spy
+SPY
 stab
 sun
 T_T
