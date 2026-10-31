@@ -586,7 +586,7 @@ Zesty
 ong
 Huzz
 Aesthetic
-ANT
+ant
 Ape
 Bay
 bin
