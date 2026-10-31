@@ -1226,7 +1226,7 @@ Tip
 Toe
 Van
 Vet
-WEB
+web
 WIG
 Yak
 zoo
