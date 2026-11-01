@@ -1144,7 +1144,7 @@ teapot
 Thrill
 toffee
 TOUCAN
-trophy
+Trophy
 Tundra
 Turkey
 Tuxedo
