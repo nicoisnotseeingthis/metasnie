@@ -118,7 +118,7 @@ sin
 slit
 soar
 son
-SPY
+spy
 stab
 sun
 T_T
