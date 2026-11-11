@@ -846,7 +846,7 @@ Alley
 ankle
 Arena
 Armor
-bagel
+Bagel
 Baker
 BATON
 Beard
