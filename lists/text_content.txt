@@ -42,7 +42,7 @@ end
 fail
 fast
 fbi
-flex
+FLEX
 fog
 foid
 food
