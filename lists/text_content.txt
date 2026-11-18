@@ -2005,7 +2005,7 @@ ease
 Echo
 Edge
 ElsE
-Epic
+epic
 even
 Ever
 evil
