@@ -9,7 +9,7 @@ aura
 rap
 ban
 bar
-bat
+Bat
 buff
 Bun
 bro
@@ -1063,7 +1063,7 @@ chorus
 cinema
 clever
 collar
-Comedy
+comedy
 Condor
 Corner
 Cosmos
