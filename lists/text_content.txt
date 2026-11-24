@@ -189,7 +189,7 @@ Dallas
 Austin
 Houston
 Atlanta
-Seattle
+seattle
 Sydney
 Venice
 Monaco
