@@ -2067,7 +2067,7 @@ mango
 Bunny
 kitty
 puppy
-cookie
+Cookie
 coffee
 Heaven
 Prince
