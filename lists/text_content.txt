@@ -1687,7 +1687,7 @@ camera
 candle
 carbon
 castle
-Center
+center
 change
 cheese
 Circle
