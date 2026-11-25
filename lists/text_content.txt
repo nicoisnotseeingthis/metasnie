@@ -9,7 +9,7 @@ aura
 rap
 ban
 bar
-bat
+Bat
 buff
 Bun
 bro
@@ -2005,7 +2005,7 @@ ease
 Echo
 Edge
 ElsE
-epic
+Epic
 even
 Ever
 evil
