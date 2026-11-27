@@ -9,7 +9,7 @@ aura
 rap
 ban
 bar
-Bat
+bat
 buff
 Bun
 bro
